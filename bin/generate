@@ -1,0 +1,81 @@
+#!/bin/sh
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(dirname "$SCRIPT_DIR")"
+POSTGRES="$ROOT/works/postgres"
+PATCH_DIR="$ROOT/works/patch"
+CORE="$ROOT/works/core"
+
+if [ ! -d "$POSTGRES/.git" ]; then
+    echo "Error: works/postgres not found. Run update first." >&2
+    exit 1
+fi
+
+if [ ! -d "$CORE" ]; then
+    echo "Error: works/core not found. Run generate first." >&2
+    exit 1
+fi
+
+IGNORE_FILE="$ROOT/works/ignore"
+
+is_ignored() {
+    [ -f "$IGNORE_FILE" ] || return 1
+    _rel="$1"
+    _name="${_rel##*/}"
+    while IFS= read -r _pattern || [ -n "$_pattern" ]; do
+        case "$_pattern" in
+            ''|\#*) continue ;;
+        esac
+        case "$_pattern" in
+            */*)
+                case "$_rel" in $_pattern) return 0 ;; esac
+                ;;
+            *)
+                case "$_name" in $_pattern) return 0 ;; esac
+                case "$_rel" in $_pattern/*) return 0 ;; esac
+                ;;
+        esac
+    done < "$IGNORE_FILE"
+    return 1
+}
+
+echo "Clearing existing patches..."
+rm -rf "$PATCH_DIR"
+mkdir -p "$PATCH_DIR"
+
+echo "Generating patches for modified/new files..."
+find "$CORE" -not -path "$CORE/.git/*" -type f | sort | while read -r dst_file; do
+    rel="${dst_file#$CORE/}"
+    if is_ignored "$rel"; then continue; fi
+    src_file="$POSTGRES/$rel"
+    patch_file="$PATCH_DIR/$rel.patch"
+
+    if [ -f "$src_file" ]; then
+        if ! diff -q "$src_file" "$dst_file" > /dev/null 2>&1; then
+            mkdir -p "$(dirname "$patch_file")"
+            diff -u --label "a/$rel" --label "b/$rel" "$src_file" "$dst_file" > "$patch_file" || true
+            echo "  Modified: $rel"
+        fi
+    else
+        mkdir -p "$(dirname "$patch_file")"
+        diff -u --label /dev/null --label "b/$rel" /dev/null "$dst_file" > "$patch_file" || true
+        echo "  New: $rel"
+    fi
+done
+
+echo "Generating patches for deleted files..."
+find "$POSTGRES" -not -path "$POSTGRES/.git/*" -type f | sort | while read -r src_file; do
+    rel="${src_file#$POSTGRES/}"
+    if is_ignored "$rel"; then continue; fi
+    dst_file="$CORE/$rel"
+    patch_file="$PATCH_DIR/$rel.patch"
+
+    if [ ! -f "$dst_file" ]; then
+        mkdir -p "$(dirname "$patch_file")"
+        diff -u --label "a/$rel" --label /dev/null "$src_file" /dev/null > "$patch_file" || true
+        echo "  Deleted: $rel"
+    fi
+done
+
+echo "Done."

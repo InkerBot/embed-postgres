@@ -1,0 +1,24 @@
+--- a/src/backend/storage/ipc/ipc.c
++++ b/src/backend/storage/ipc/ipc.c
+@@ -44,6 +44,11 @@
+  * Set when shmem_exit() is in progress.
+  */
+ bool		shmem_exit_inprogress = false;
++
++/*
++ * Embed mode: exit code set by proc_exit for observability.
++ */
++int			embed_exit_code = 0;
+ 
+ /*
+  * This flag tracks whether we've called atexit() in the current process
+@@ -111,6 +116,9 @@
+ 	/* Clean up everything that must be cleaned up */
+ 	proc_exit_prepare(code);
+ 
++	/* Embed mode: record exit code for observability */
++	embed_exit_code = code;
++
+ #ifdef PROFILE_PID_DIR
+ 	{
+ 		/*

@@ -1,0 +1,246 @@
+--- a/src/backend/postmaster/postmaster.c
++++ b/src/backend/postmaster/postmaster.c
+@@ -72,6 +72,7 @@
+ #include <ctype.h>
+ #include <sys/stat.h>
+ #include <sys/socket.h>
++#include <sys/un.h>
+ #include <fcntl.h>
+ #include <sys/param.h>
+ #include <netdb.h>
+@@ -398,6 +399,13 @@
+ /* event multiplexing object */
+ static WaitEventSet *pm_wait_set;
+ 
++/* Embed mode state */
++static bool embed_mode = false;
++static int embed_control_fd = -1;
++
++static int embed_recv_fd(int socket, char *cmd);
++static void embed_handle_control_event(void);
++
+ #ifdef USE_SSL
+ /* Set when and if SSL has been initialized properly */
+ bool		LoadedSSL = false;
+@@ -1271,7 +1279,7 @@
+ 	/*
+ 	 * check that we have some socket to listen on
+ 	 */
+-	if (NumListenSockets == 0)
++	if (NumListenSockets == 0 && !embed_mode)
+ 		ereport(FATAL,
+ 				(errmsg("no socket created for listening")));
+ 
+@@ -1639,12 +1647,17 @@
+ static void
+ ConfigurePostmasterWaitSet(bool accept_connections)
+ {
++	int capacity;
++
+ 	if (pm_wait_set)
+ 		FreeWaitEventSet(pm_wait_set);
+ 	pm_wait_set = NULL;
+ 
+-	pm_wait_set = CreateWaitEventSet(NULL,
+-									 accept_connections ? (1 + NumListenSockets) : 1);
++	capacity = accept_connections ? (1 + NumListenSockets) : 1;
++	if (embed_mode && embed_control_fd >= 0)
++		capacity++;
++
++	pm_wait_set = CreateWaitEventSet(NULL, capacity);
+ 	AddWaitEventToSet(pm_wait_set, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch,
+ 					  NULL);
+ 
+@@ -1654,6 +1667,11 @@
+ 			AddWaitEventToSet(pm_wait_set, WL_SOCKET_ACCEPT, ListenSockets[i],
+ 							  NULL, NULL);
+ 	}
++
++	/* Always monitor the embed control fd (for both connections and shutdown) */
++	if (embed_mode && embed_control_fd >= 0)
++		AddWaitEventToSet(pm_wait_set, WL_SOCKET_READABLE, embed_control_fd,
++						  NULL, NULL);
+ }
+ 
+ /*
+@@ -1664,7 +1682,7 @@
+ {
+ 	time_t		last_lockfile_recheck_time,
+ 				last_touch_time;
+-	WaitEvent	events[MAXLISTEN];
++	WaitEvent	events[MAXLISTEN + 2];
+ 	int			nevents;
+ 
+ 	ConfigurePostmasterWaitSet(true);
+@@ -1705,18 +1723,26 @@
+ 			if (pending_pm_pmsignal)
+ 				process_pm_pmsignal();
+ 
+-			if (events[i].events & WL_SOCKET_ACCEPT)
++			if (events[i].events & (WL_SOCKET_ACCEPT | WL_SOCKET_READABLE))
+ 			{
+-				ClientSocket s;
++				if (embed_mode && events[i].fd == embed_control_fd)
++				{
++					/* Embed control fd: handle connection or shutdown */
++					embed_handle_control_event();
++				}
++				else if (events[i].events & WL_SOCKET_ACCEPT)
++				{
++					ClientSocket s;
+ 
+-				if (AcceptConnection(events[i].fd, &s) == STATUS_OK)
+-					BackendStartup(&s);
++					if (AcceptConnection(events[i].fd, &s) == STATUS_OK)
++						BackendStartup(&s);
+ 
+-				/* We no longer need the open socket in this process */
+-				if (s.sock != PGINVALID_SOCKET)
+-				{
+-					if (closesocket(s.sock) != 0)
+-						elog(LOG, "could not close client socket: %m");
++					/* We no longer need the open socket in this process */
++					if (s.sock != PGINVALID_SOCKET)
++					{
++						if (closesocket(s.sock) != 0)
++							elog(LOG, "could not close client socket: %m");
++					}
+ 				}
+ 			}
+ 		}
+@@ -1909,6 +1935,13 @@
+ 	ListenSockets = NULL;
+ #endif
+ 
++	/* Close the embed control fd in child processes */
++	if (embed_mode && embed_control_fd >= 0)
++	{
++		close(embed_control_fd);
++		embed_control_fd = -1;
++	}
++
+ 	/*
+ 	 * If using syslogger, close the read side of the pipe.  We don't bother
+ 	 * tracking this in fd.c, either.
+@@ -2362,6 +2395,13 @@
+ #ifdef USE_SYSTEMD
+ 			sd_notify(0, "READY=1");
+ #endif
++
++			/* Notify embed parent that server is ready */
++			if (embed_mode && embed_control_fd >= 0)
++			{
++				char ready_byte = 'R';
++				send(embed_control_fd, &ready_byte, 1, 0);
++			}
+ 
+ 			continue;
+ 		}
+@@ -3769,6 +3809,13 @@
+ 		sd_notify(0, "READY=1");
+ #endif
+ 
++		/* Notify embed parent that server is ready */
++		if (embed_mode && embed_control_fd >= 0)
++		{
++			char ready_byte = 'R';
++			send(embed_control_fd, &ready_byte, 1, 0);
++		}
++
+ 		UpdatePMState(PM_HOT_STANDBY);
+ 		connsAllowed = true;
+ 
+@@ -4641,3 +4688,93 @@
+ 								 GetLastError())));
+ #endif							/* WIN32 */
+ }
++
++/*
++ * Receive a file descriptor via SCM_RIGHTS on the embed control socket.
++ * Sets *cmd to the command byte ('C' for connect, 'S' for shutdown).
++ * Returns the received fd, or -1 on error/disconnect.
++ */
++static int
++embed_recv_fd(int socket, char *cmd)
++{
++	char cmsgbuf[CMSG_SPACE(sizeof(int))];
++	struct cmsghdr *cmsg;
++	struct iovec iov;
++	struct msghdr msg;
++	int fd;
++
++	iov.iov_base = cmd;
++	iov.iov_len = 1;
++
++	memset(cmsgbuf, 0, sizeof(cmsgbuf));
++	memset(&msg, 0, sizeof(msg));
++	msg.msg_iov = &iov;
++	msg.msg_iovlen = 1;
++	msg.msg_control = cmsgbuf;
++	msg.msg_controllen = sizeof(cmsgbuf);
++
++	if (recvmsg(socket, &msg, 0) <= 0)
++		return -1;
++
++	cmsg = CMSG_FIRSTHDR(&msg);
++	if (!cmsg)
++		return -1;
++
++	memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
++	return fd;
++}
++
++/*
++ * Handle an event on the embed control fd.
++ * Called from ServerLoop when the control fd is readable.
++ */
++static void
++embed_handle_control_event(void)
++{
++	char cmd = 0;
++	int fd = embed_recv_fd(embed_control_fd, &cmd);
++
++	if (fd < 0 || cmd == 'S')
++	{
++		/* Shutdown request or control fd closed */
++		pending_pm_fast_shutdown_request = true;
++		pending_pm_shutdown_request = true;
++		SetLatch(MyLatch);
++		return;
++	}
++
++	if (cmd == 'C')
++	{
++		ClientSocket cs;
++		char ack = 'A';
++
++		/* Connection request: create ClientSocket and start a backend */
++		cs.sock = fd;
++		memset(&cs.raddr, 0, sizeof(cs.raddr));
++		cs.raddr.addr.ss_family = AF_UNIX;
++		cs.raddr.salen = sizeof(struct sockaddr_un);
++		BackendStartup(&cs);
++
++		/* Close the fd — BackendStartup has forked and the child has its copy */
++		close(fd);
++
++		/* Send ACK to parent */
++		send(embed_control_fd, &ack, 1, 0);
++	}
++}
++
++/*
++ * Embed mode API functions
++ */
++void
++embed_set_postmaster_mode(bool mode)
++{
++	embed_mode = mode;
++}
++
++void
++embed_set_control_fd(int fd)
++{
++	embed_control_fd = fd;
++}
++

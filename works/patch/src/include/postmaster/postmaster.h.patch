@@ -1,0 +1,11 @@
+--- a/src/include/postmaster/postmaster.h
++++ b/src/include/postmaster/postmaster.h
+@@ -142,4 +142,8 @@
+ 
+ extern DispatchOption parse_dispatch_option(const char *name);
+ 
++/* Embed mode API */
++extern void embed_set_postmaster_mode(bool mode);
++extern void embed_set_control_fd(int fd);
++
+ #endif							/* _POSTMASTER_H */

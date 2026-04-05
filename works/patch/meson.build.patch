@@ -1,0 +1,33 @@
+--- a/meson.build
++++ b/meson.build
+@@ -275,7 +275,11 @@
+   export_file_format = 'darwin'
+   export_fmt = '-Wl,-exported_symbols_list,@0@'
+ 
+-  mod_link_args_fmt = ['-bundle_loader', '@0@']
++  # embed-postgres: use flat namespace for extension modules so that backend
++  # symbols (e.g. CurrentMemoryContext) are resolved at load time from any
++  # loaded image (including libpg_server.dylib loaded with RTLD_GLOBAL),
++  # rather than being bound to a specific executable via -bundle_loader.
++  mod_link_args_fmt = []
+   mod_link_with_dir = 'bindir'
+   mod_link_with_name = '@0@'
+ 
+@@ -287,14 +291,9 @@
+     ldflags += ['-isysroot', pg_sysroot]
+   endif
+ 
+-  # meson defaults to -Wl,-undefined,dynamic_lookup for modules, which we
+-  # don't want because a) it's different from what we do for autoconf, b) it
+-  # causes warnings in macOS Ventura. But using -Wl,-undefined,error causes a
+-  # warning starting in Sonoma. So only add -Wl,-undefined,error if it does
+-  # not cause a warning.
+-  if cc.has_multi_link_arguments('-Wl,-undefined,error', '-Werror')
+-    ldflags_mod += '-Wl,-undefined,error'
+-  endif
++  # embed-postgres: flat namespace + suppress undefined symbols at link time;
++  # they are resolved at runtime from libpg_server.dylib loaded with RTLD_GLOBAL.
++  ldflags_mod += ['-Wl,-flat_namespace', '-Wl,-undefined,suppress']
+ 
+   # Starting in Sonoma, the linker warns about the same library being
+   # linked twice.  Which can easily happen when multiple dependencies

@@ -1,0 +1,38 @@
+#!/bin/sh
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(dirname "$SCRIPT_DIR")"
+POSTGRES="$ROOT/works/postgres"
+REV_FILE="$ROOT/works/rev"
+
+# defaults
+REPO_URL="https://github.com/postgres/postgres.git"
+UPSTREAM_BRANCH="master"
+
+CONFIG="$ROOT/works/config"
+if [ -f "$CONFIG" ]; then
+    . "$CONFIG"
+fi
+
+if [ -d "$POSTGRES/.git" ]; then
+    echo "Updating postgres..."
+    git -C "$POSTGRES" fetch --all
+    if [ -n "$UPSTREAM_BRANCH" ]; then
+        git -C "$POSTGRES" checkout "$UPSTREAM_BRANCH"
+    fi
+    git -C "$POSTGRES" pull
+else
+    echo "Cloning postgres..."
+    if [ -n "$UPSTREAM_BRANCH" ]; then
+        git clone -b "$UPSTREAM_BRANCH" "$REPO_URL" "$POSTGRES"
+    else
+        git clone "$REPO_URL" "$POSTGRES"
+    fi
+fi
+
+REV="$(git -C "$POSTGRES" rev-parse HEAD)"
+echo "$REV" > "$REV_FILE"
+
+echo "Done. Version: $(git -C "$POSTGRES" describe --tags --always 2>/dev/null || echo "$REV")"
+echo "Stored rev: $REV"

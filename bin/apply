@@ -1,0 +1,93 @@
+#!/bin/sh
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(dirname "$SCRIPT_DIR")"
+POSTGRES="$ROOT/works/postgres"
+PATCH_DIR="$ROOT/works/patch"
+OUTPUT="$ROOT/works/core"
+REV_FILE="$ROOT/works/rev"
+
+# defaults
+REPO_URL="git@git.inker.bot:arknights/postgres.git"
+UPSTREAM_BRANCH="main"
+
+CONFIG="$ROOT/works/config"
+if [ -f "$CONFIG" ]; then
+    . "$CONFIG"
+fi
+
+# Clone if not present
+if [ ! -d "$POSTGRES/.git" ]; then
+    echo "Cloning postgres..."
+    if [ -n "$UPSTREAM_BRANCH" ]; then
+        git clone -b "$UPSTREAM_BRANCH" "$REPO_URL" "$POSTGRES"
+    else
+        git clone "$REPO_URL" "$POSTGRES"
+    fi
+fi
+
+# Checkout stored rev
+if [ -f "$REV_FILE" ]; then
+    REV="$(cat "$REV_FILE" | tr -d '[:space:]')"
+    echo "Checking out stored rev: $REV"
+    git -C "$POSTGRES" fetch --all
+    git -C "$POSTGRES" checkout "$REV"
+else
+    echo "Warning: works/rev not found, using current HEAD." >&2
+fi
+
+echo "Initializing works/core/..."
+rm -rf "$OUTPUT"
+mkdir -p "$OUTPUT"
+git init "$OUTPUT"
+
+echo "Syncing postgres files to works/core/..."
+rsync -a --exclude='.git/' "$POSTGRES/" "$OUTPUT/"
+VERSION="$(git -C "$POSTGRES" describe --tags --always 2>/dev/null || git -C "$POSTGRES" rev-parse --short HEAD)"
+git -C "$OUTPUT" add -A
+git -C "$OUTPUT" commit -m "upstream: $VERSION"
+
+echo "Applying patches..."
+applied=0
+failed=0
+failed_list=""
+
+if [ -d "$PATCH_DIR" ]; then
+    patch_list="$(mktemp)"
+    trap 'rm -f "$patch_list"' EXIT
+    find "$PATCH_DIR" -name "*.patch" | sort > "$patch_list"
+
+    while IFS= read -r patch_file; do
+        rel="${patch_file#$PATCH_DIR/}"
+        rel="${rel%.patch}"
+        dst="$OUTPUT/$rel"
+
+        mkdir -p "$(dirname "$dst")"
+        if patch --merge --no-backup-if-mismatch --force "$dst" < "$patch_file"; then
+            applied=$((applied + 1))
+        else
+            echo "  FAILED:  $rel" >&2
+            failed=$((failed + 1))
+            failed_list="${failed_list}    ${rel}
+"
+        fi
+    done < "$patch_list"
+fi
+
+git -C "$OUTPUT" add -A
+git -C "$OUTPUT" commit -m "patches applied" --allow-empty
+
+total=$((applied + failed))
+echo ""
+echo "Result: $applied/$total patches applied."
+if [ "$failed" -gt 0 ]; then
+    echo ""
+    echo "Failed patches (merge conflicts written to files):"
+    printf "%s" "$failed_list"
+    echo ""
+    echo "Resolve conflicts in works/core/, then run 'bin/generate' to update patches."
+    exit 1
+fi
+
+echo "Done."
