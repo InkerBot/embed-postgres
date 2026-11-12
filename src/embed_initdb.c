@@ -1,40 +1,15 @@
-/*
- * embed_initdb.c
- *    Initialize a PostgreSQL data directory using the embedded initdb.
- *
- * Instead of calling an external initdb binary via system(), this forks
- * a child process and calls initdb_main() directly. The initdb code is
- * compiled into the embed library (linked from PG's initdb sources),
- * so it's available in-process after fork().
- *
- * The embedding library loads the PG shared library, resolves pg_main via
- * dlsym, and sets embed_pg_main_hook in initdb.c. The tokenizer and
- * fork+call logic for popen/pclose/system replacements live in initdb.c
- * itself, so the embed library just needs to provide the pg_main pointer.
- */
 #include "embed_postgres.h"
+#include "embed_internal.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
-#include <dlfcn.h>
-#include <limits.h>
 
-/* From PG's initdb.c (renamed from main) */
-extern int initdb_main(int argc, char *argv[]);
-
-/* Embed pg_main hook declared in initdb.c */
-typedef int (*pg_main_fn)(int argc, char **argv);
-extern pg_main_fn embed_pg_main_hook;
-
-/* From embed_loader.c */
-extern void *embed_load_pg_library(void);
-
-/* -----------------------------------------------------------------------
- * embed_pg_initdb — public API
- * ----------------------------------------------------------------------- */
 int
 embed_pg_initdb(const embed_pg_options *opts)
 {
@@ -45,148 +20,176 @@ embed_pg_initdb(const embed_pg_options *opts)
     const char *encoding  = opts->encoding  ? opts->encoding  : "UTF8";
 
     /*
-     * Derive an absolute path to the postgres binary from the share
-     * directory so that bin_path in initdb is set to a sane value.
-     * The binary does not need to exist; EMBED_POSTGRES_EXEC bypasses
-     * version checking and the hook handles all actual invocations.
+     * Every path below goes through the caller's resolver too: the data
+     * directory exists in whatever namespace it defines, and this process
+     * cannot reach it any other way.
      */
-    char real_share[PATH_MAX];
-    char postgres_bin[PATH_MAX];
-    const char *abs_share;
+    const embed_pg_fs *fs = opts->fs ? opts->fs
+        : &embed_pg_fs_passthrough;
+    struct stat st;
 
-    if (realpath(opts->pg_data_path, real_share) != NULL)
-    {
-        abs_share = real_share;
+    embed_pg_fs_enter(opts->fs_private_data);
 
-        /* Derive prefix/bin/postgres: go up one level from the share dir */
-        char prefix[PATH_MAX];
-        strlcpy(prefix, real_share, sizeof(prefix));
-        char *sep = strrchr(prefix, '/');
-        if (sep) *sep = '\0';
-        snprintf(postgres_bin, sizeof(postgres_bin),
-                 "%s/bin/postgres", prefix);
+    /*
+     * Refuse a directory that already holds a cluster, the same way initdb
+     * itself would.  Checking up front is what lets the outcome be read off the
+     * file system afterwards: a version stamp left by an earlier run would
+     * otherwise be indistinguishable from one this run produced.
+     */
+    char version_path[PATH_MAX];
+
+    snprintf(version_path, sizeof(version_path), "%s/PG_VERSION",
+             opts->data_dir);
+    if (fs->getattr(version_path, &st, NULL) == 0) {
+        fprintf(stderr, "embed_initdb: %s already contains a database cluster\n",
+                opts->data_dir);
+        return -1;
     }
-    else
-    {
-        /* realpath failed (path doesn't exist yet or is already absolute) */
-        abs_share = opts->pg_data_path;
-        snprintf(postgres_bin, sizeof(postgres_bin),
-                 "%s/../bin/postgres", opts->pg_data_path);
-    }
+
+    /*
+     * initdb finds the backend it bootstraps with next to itself, so it runs
+     * out of the same extracted prefix the postmaster does.
+     */
+    char runtime[PATH_MAX];
+
+    if (embed_extract_runtime(opts->pg_data_path, runtime) < 0)
+        return -1;
+
+    char initdb_bin[PATH_MAX];
+    snprintf(initdb_bin, sizeof(initdb_bin), "%s/bin/initdb", runtime);
+
+    const char *argv[] = {
+        initdb_bin,
+        "-D", opts->data_dir,
+        "--no-locale",
+        "-U", superuser,
+        "-E", encoding,
+        "-A", "trust",
+        "-N",                   /* --no-sync */
+        "--no-instructions",
+        NULL
+    };
 
     fprintf(stderr, "embed_initdb: initializing data directory %s...\n",
             opts->data_dir);
 
     /*
-     * Fork a child process for initdb.  Necessary because initdb uses
-     * global state, atexit handlers, and signal handlers.
+     * initdb speaks no control protocol, so completion is observed instead of
+     * reported: it inherits the write end of this pipe, which the kernel closes
+     * for it — and for anything it spawned — on exit, and the read below then
+     * sees end of file.  waitpid() would be the obvious way to wait, and is
+     * exactly what a host's own child reaping can take away from us.
      */
-    pid_t child = fork();
-    if (child < 0)
-    {
-        fprintf(stderr, "embed_initdb: fork failed\n");
+    int done[2];
+
+    if (pipe(done) < 0) {
+        fprintf(stderr, "embed_initdb: pipe failed: %s\n", strerror(errno));
+        embed_remove_runtime(runtime);
         return -1;
     }
 
-    if (child == 0)
-    {
-        /*
-         * Child process.
-         *
-         * Load the embedded PG library and set the pg_main hook so that
-         * initdb's popen/pclose/system replacements can call pg_main
-         * in forked grandchildren.
-         */
-        void *handle = embed_load_pg_library();
-        if (!handle)
-        {
-            fprintf(stderr, "embed_initdb: failed to load embedded PG library\n");
-            _exit(1);
+    /* Nothing to serve when the caller did not bring a filesystem */
+    char vfs_sock[PATH_MAX];
+    const char *vfs_sock_arg = NULL;
+    struct embed_vfs_server *vfs_server = NULL;
+
+    if (opts->fs != NULL) {
+        snprintf(vfs_sock, sizeof(vfs_sock), "%s/vfs.sock", runtime);
+        vfs_server = embed_vfs_server_start(opts->fs, opts->fs_private_data,
+                                            vfs_sock);
+        if (vfs_server == NULL) {
+            close(done[0]);
+            close(done[1]);
+            embed_remove_runtime(runtime);
+            return -1;
         }
-        pg_main_fn pg_main = (pg_main_fn) dlsym(handle, "pg_main");
-        if (!pg_main)
-        {
-            fprintf(stderr, "embed_initdb: dlsym(pg_main) failed: %s\n",
-                    dlerror());
-            _exit(1);
-        }
-
-        embed_pg_main_hook = pg_main;
-
-        /*
-         * Tell setup_bin_paths() where "postgres" lives (bypasses
-         * find_other_exec version check).  Also pass -L so initdb
-         * reads BKI/SQL files from the correct share directory without
-         * needing to derive it from the binary path.
-         *
-         * Set PGSHAREDIR so that the embedded postgres subprocesses
-         * (--boot, --check, standalone) find timezone and other share
-         * files from our embedded installation, not from any system PG.
-         */
-        setenv("EMBED_POSTGRES_EXEC", postgres_bin, 1);
-        setenv("PGSHAREDIR", abs_share, 1);
-
-        const char *initdb_argv[] = {
-            postgres_bin,           /* argv[0]: used as program name */
-            "-D", opts->data_dir,
-            "-L", abs_share,        /* share directory (absolute path) */
-            "--no-locale",
-            "-U", superuser,
-            "-E", encoding,
-            "-A", "trust",
-            "-N",                   /* --no-sync: skip fsync for speed */
-            "--no-instructions",    /* suppress startup instructions */
-            NULL
-        };
-
-        int argc = 0;
-        while (initdb_argv[argc]) argc++;
-
-        int rc = initdb_main(argc, (char **)initdb_argv);
-        _exit(rc);
+        vfs_sock_arg = vfs_sock;
     }
 
-    /* Parent: wait for initdb child */
-    int status;
-    waitpid(child, &status, 0);
+    pid_t child;
+    if (embed_spawn(initdb_bin, argv, done[1], vfs_sock_arg, &child) < 0) {
+        fprintf(stderr, "embed_initdb: cannot run initdb: %s\n",
+                strerror(errno));
+        close(done[0]);
+        close(done[1]);
+        embed_vfs_server_stop(vfs_server);
+        embed_remove_runtime(runtime);
+        return -1;
+    }
+    close(done[1]);
 
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-    {
-        fprintf(stderr, "embed_initdb: initdb failed (status=%d)\n",
-                WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    for (;;) {
+        char byte;
+        ssize_t n = read(done[0], &byte, 1);
+
+        if (n == 0)
+            break;                      /* every writer is gone: it finished */
+        if (n < 0 && errno != EINTR) {
+            fprintf(stderr, "embed_initdb: waiting for initdb failed: %s\n",
+                    strerror(errno));
+            break;
+        }
+    }
+    close(done[0]);
+
+    embed_reap(child);
+    embed_vfs_server_stop(vfs_server);
+    embed_remove_runtime(runtime);
+
+    /*
+     * And the outcome is read off the result, not off an exit status: initdb
+     * tears the directory down again when it fails, so a data directory that
+     * carries a version stamp is one that was built.
+     */
+    if (fs->getattr(version_path, &st, NULL) != 0) {
+        fprintf(stderr, "embed_initdb: initdb did not produce a data directory\n");
         return -1;
     }
 
-    /* Write optimized postgresql.conf for embedded mode */
-    char conf_path[1024];
+    char conf_path[PATH_MAX];
     snprintf(conf_path, sizeof(conf_path), "%s/postgresql.conf", opts->data_dir);
-    FILE *f = fopen(conf_path, "a");
-    if (f)
+
+    embed_pg_fs_file_info fi;
+
+    memset(&fi, 0, sizeof(fi));
+    fi.flags = O_WRONLY | O_APPEND;
+    if (fs->open && fs->open(conf_path, &fi) == 0)
     {
-        fprintf(f,
+        static const char settings[] =
             "\n# Embedded PostgreSQL optimizations\n"
             "max_wal_senders = 0\n"
             "wal_level = minimal\n"
             "fsync = off\n"
             "synchronous_commit = off\n"
-            "full_page_writes = off\n"
-        );
-        fclose(f);
+            "full_page_writes = off\n";
+        size_t remaining = sizeof(settings) - 1;
+        const char *p = settings;
+        off_t offset = st.st_size;
+
+        if (fs->getattr(conf_path, &st, &fi) == 0)
+            offset = st.st_size;
+
+        while (remaining > 0 && fs->write)
+        {
+            int n = fs->write(conf_path, p, remaining, offset, &fi);
+
+            if (n <= 0)
+                break;
+            p += n;
+            offset += n;
+            remaining -= (size_t) n;
+        }
+        if (fs->release)
+            fs->release(conf_path, &fi);
     }
 
-    /* Append pg_hba.conf rule for embed connections (socketpair) */
-    char hba_path[1024];
-    snprintf(hba_path, sizeof(hba_path), "%s/pg_hba.conf", opts->data_dir);
-    f = fopen(hba_path, "a");
-    if (f)
-    {
-        fprintf(f,
-            "\n# Trust all connections (for embed mode socketpair)\n"
-            "host    all    all    0.0.0.0/0    trust\n"
-            "host    all    all    ::/0          trust\n"
-        );
-        fclose(f);
-    }
+    /*
+     * pg_hba.conf is deliberately left as initdb generated it: embed
+     * connections look like AF_UNIX peers, so they already match its "local all
+     * all trust" line.  A blanket "host all all 0.0.0.0/0 trust" would add
+     * nothing here while exposing the cluster the moment a caller sets
+     * listen_address/port.
+     */
 
     fprintf(stderr, "embed_initdb: done.\n");
     return 0;

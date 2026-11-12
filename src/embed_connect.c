@@ -1,27 +1,11 @@
-/*
- * embed_connect.c
- *    Create embedded connections via socketpair + SCM_RIGHTS + PQconnectSocket.
- *
- * Flow:
- * 1. socketpair() creates a pre-connected fd pair
- * 2. Server-side fd is sent to the child process via SCM_RIGHTS
- * 3. Postmaster receives it via the control channel
- * 4. Postmaster forks a backend for it (BackendStartup)
- * 5. Client-side fd is wrapped in a PGconn via PQconnectSocket()
- */
 #include "embed_postgres.h"
 #include "embed_internal.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
 
-/*
- * Send a file descriptor to another process via SCM_RIGHTS,
- * along with a single-byte command.
- */
 static int
 send_fd(int socket, int fd_to_send, char cmd)
 {
@@ -41,7 +25,7 @@ send_fd(int socket, int fd_to_send, char cmd)
     cmsg->cmsg_len = CMSG_LEN(sizeof(int));
     memcpy(CMSG_DATA(cmsg), &fd_to_send, sizeof(int));
 
-    return (int)sendmsg(socket, &msg, 0);
+    return (int)sendmsg(socket, &msg, EMBED_SEND_FLAGS);
 }
 
 PGconn *
@@ -56,34 +40,41 @@ embed_pg_connect(embed_pg_server *srv,
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
         return NULL;
 
-    /*
-     * Serialize embed connections: the postmaster has a single pending slot.
-     */
-    pthread_mutex_lock(&srv->connect_mutex);
+    /* One request in flight: concurrent readers would steal reply bytes */
+    pthread_mutex_lock(&srv->control_mutex);
 
-    /* Send server-side fd to child via SCM_RIGHTS */
-    if (send_fd(srv->control_fd, sv[0], 'C') < 0) {
-        pthread_mutex_unlock(&srv->connect_mutex);
+    if (send_fd(srv->control_fd, sv[0], EMBED_CMD_CONNECT) < 0) {
+        pthread_mutex_unlock(&srv->control_mutex);
         close(sv[0]);
         close(sv[1]);
         return NULL;
     }
+
+    int reply = embed_control_wait(srv, EMBED_MSG_ACK, EMBED_CONNECT_TIMEOUT_MS);
+
+    pthread_mutex_unlock(&srv->control_mutex);
+
+    /*
+     * The reply byte is the barrier for dropping our reference: closing right
+     * after sendmsg() leaves the descriptor in flight with the socket buffer as
+     * its only reference, and macOS's AF_UNIX garbage collector can tear the
+     * socket down before the postmaster internalizes it.  The backend is then
+     * forked onto a socket whose peer is gone, reads EOF instead of a startup
+     * packet, and exits silently — the host sees "server closed the connection
+     * unexpectedly" milliseconds after a successful ACK.
+     */
     close(sv[0]);
 
-    /* Wait for ACK (child has submitted fd to postmaster) */
-    char ack;
-    if (recv(srv->control_fd, &ack, 1, 0) <= 0) {
-        pthread_mutex_unlock(&srv->connect_mutex);
+    /*
+     * EMBED_MSG_ERROR means BackendStartup() failed, so nothing is listening on
+     * sv[1]; handing back a PGconn would only defer the failure to the first
+     * query.
+     */
+    if (reply != EMBED_MSG_ACK) {
         close(sv[1]);
         return NULL;
     }
 
-    pthread_mutex_unlock(&srv->connect_mutex);
-
-    /*
-     * Build conninfo string for PQconnectSocket.
-     * This provides parameters the startup packet will carry.
-     */
     char conninfo[1024];
     snprintf(conninfo, sizeof(conninfo),
              "dbname='%s' user='%s'",

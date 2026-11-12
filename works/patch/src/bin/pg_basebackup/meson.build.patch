@@ -1,0 +1,16 @@
+diff --git a/src/bin/pg_basebackup/meson.build b/src/bin/pg_basebackup/meson.build
+index d70ce57..c8c6962 100644
+--- a/src/bin/pg_basebackup/meson.build
++++ b/src/bin/pg_basebackup/meson.build
+@@ -8,8 +8,11 @@ common_sources = files(
+ )
+ 
+ pg_basebackup_deps = [frontend_code, libpq, lz4, zlib, zstd]
++# Its Walfile methods are named open/close/write, which the embed VFS macros
++# would claim; these tools do not go through the host's file system anyway.
+ pg_basebackup_common = static_library('libpg_basebackup_common',
+   common_sources,
++  c_args: ['-DEMBED_VFS_NO_REDIRECT'],
+   dependencies: pg_basebackup_deps,
+   kwargs: internal_lib_args,
+ )

@@ -23,7 +23,6 @@ TEST_F(StressTest, TenConcurrentConnections) {
         conns.push_back(c);
     }
 
-    // All should work
     for (int i = 0; i < 10; i++) {
         PGresult *res = conns[i]->exec("SELECT 1");
         ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
@@ -37,7 +36,7 @@ TEST_F(StressTest, RapidConnectDisconnect) {
     for (int i = 0; i < 30; i++) {
         PGconn *conn = embed_pg_connect(srv(), "postgres", "postgres");
         ASSERT_NE(conn, nullptr) << "Iteration " << i;
-        ASSERT_EQ(PQstatus(conn), CONNECTION_OK) << "Iteration " << i;
+        ASSERT_EQ(PQstatus(conn), CONNECTION_OK) << "Iteration " << i << ": " << PQerrorMessage(conn);
         PQfinish(conn);
     }
 }
@@ -46,7 +45,6 @@ TEST_F(StressTest, LargeQueryResult) {
     TestConnection conn(srv());
     ASSERT_TRUE(conn.is_ok());
 
-    // ~1MB of data: repeat('x', 1000) * 1000 rows = ~1MB
     PGresult *res = conn.exec(
         "SELECT repeat('x', 1000) FROM generate_series(1, 1000)");
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);

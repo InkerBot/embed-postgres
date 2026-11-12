@@ -1,0 +1,12 @@
+diff --git a/src/port/meson.build b/src/port/meson.build
+index 7296f8e..d5f31e4 100644
+--- a/src/port/meson.build
++++ b/src/port/meson.build
+@@ -2,6 +2,7 @@
+ 
+ pgport_sources = [
+   'bsearch_arg.c',
++  'embed_vfs.c',
+   'chklocale.c',
+   'inet_net_ntop.c',
+   'noblock.c',

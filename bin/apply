@@ -2,22 +2,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(dirname "$SCRIPT_DIR")"
-POSTGRES="$ROOT/works/postgres"
-PATCH_DIR="$ROOT/works/patch"
-OUTPUT="$ROOT/works/core"
-REV_FILE="$ROOT/works/rev"
+. "$SCRIPT_DIR/common.sh"
 
-# defaults
-REPO_URL="git@git.inker.bot:arknights/postgres.git"
-UPSTREAM_BRANCH="main"
-
-CONFIG="$ROOT/works/config"
-if [ -f "$CONFIG" ]; then
-    . "$CONFIG"
-fi
-
-# Clone if not present
 if [ ! -d "$POSTGRES/.git" ]; then
     echo "Cloning postgres..."
     if [ -n "$UPSTREAM_BRANCH" ]; then
@@ -27,26 +13,24 @@ if [ ! -d "$POSTGRES/.git" ]; then
     fi
 fi
 
-# Checkout stored rev
 if [ -f "$REV_FILE" ]; then
-    REV="$(cat "$REV_FILE" | tr -d '[:space:]')"
+    REV="$(tr -d '[:space:]' < "$REV_FILE")"
     echo "Checking out stored rev: $REV"
-    git -C "$POSTGRES" fetch --all
-    git -C "$POSTGRES" checkout "$REV"
+    checkout_upstream_rev "$REV"
 else
     echo "Warning: works/rev not found, using current HEAD." >&2
 fi
 
 echo "Initializing works/core/..."
-rm -rf "$OUTPUT"
-mkdir -p "$OUTPUT"
-git init "$OUTPUT"
+rm -rf "$CORE"
+mkdir -p "$CORE"
+git init --quiet "$CORE"
 
 echo "Syncing postgres files to works/core/..."
-rsync -a --exclude='.git/' "$POSTGRES/" "$OUTPUT/"
+rsync -a --exclude='.git/' "$POSTGRES/" "$CORE/"
 VERSION="$(git -C "$POSTGRES" describe --tags --always 2>/dev/null || git -C "$POSTGRES" rev-parse --short HEAD)"
-git -C "$OUTPUT" add -A
-git -C "$OUTPUT" commit -m "upstream: $VERSION"
+core_git add -A
+core_git commit --quiet -m "upstream: $VERSION"
 
 echo "Applying patches..."
 applied=0
@@ -61,10 +45,13 @@ if [ -d "$PATCH_DIR" ]; then
     while IFS= read -r patch_file; do
         rel="${patch_file#$PATCH_DIR/}"
         rel="${rel%.patch}"
-        dst="$OUTPUT/$rel"
 
-        mkdir -p "$(dirname "$dst")"
-        if patch --merge --no-backup-if-mismatch --force "$dst" < "$patch_file"; then
+        mkdir -p "$(dirname "$CORE/$rel")"
+
+        # --3way writes conflict markers instead of rejecting a patch that no
+        # longer applies.  It needs the "index" lines bin/generate emits and the
+        # upstream blobs, which the commit above put in works/core's objects.
+        if core_git apply --3way --whitespace=nowarn "$patch_file"; then
             applied=$((applied + 1))
         else
             echo "  FAILED:  $rel" >&2
@@ -75,8 +62,8 @@ if [ -d "$PATCH_DIR" ]; then
     done < "$patch_list"
 fi
 
-git -C "$OUTPUT" add -A
-git -C "$OUTPUT" commit -m "patches applied" --allow-empty
+core_git add -A
+core_git commit --quiet -m "patches applied" --allow-empty
 
 total=$((applied + failed))
 echo ""

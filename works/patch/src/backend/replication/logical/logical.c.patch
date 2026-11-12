@@ -1,0 +1,14 @@
+diff --git a/src/backend/replication/logical/logical.c b/src/backend/replication/logical/logical.c
+index 603a2b9..560a9d4 100644
+--- a/src/backend/replication/logical/logical.c
++++ b/src/backend/replication/logical/logical.c
+@@ -698,7 +698,8 @@ OutputPluginWrite(struct LogicalDecodingContext *ctx, bool last_write)
+ 	if (!ctx->prepared_write)
+ 		elog(ERROR, "OutputPluginPrepareWrite needs to be called before OutputPluginWrite");
+ 
+-	ctx->write(ctx, ctx->write_location, ctx->write_xid, last_write);
++	/* Parenthesised so that a write() macro cannot claim this member */
++	(ctx->write) (ctx, ctx->write_location, ctx->write_xid, last_write);
+ 	ctx->prepared_write = false;
+ }
+ 

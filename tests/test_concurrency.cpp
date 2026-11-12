@@ -1,10 +1,3 @@
-/*
- * test_concurrency.cpp
- *    Multi-threaded concurrency tests for embed_postgres.
- *
- * Tests thread-safety of embed_pg_connect (serialized by connect_mutex),
- * concurrent query execution, and data consistency under parallel access.
- */
 #include "test_helpers.hpp"
 #include <thread>
 #include <vector>
@@ -14,8 +7,6 @@
 #include <cstring>
 
 class ConcurrencyTest : public EmbedPgTest {};
-
-// ---- Multi-threaded connection creation ----
 
 TEST_F(ConcurrencyTest, ConcurrentConnectFromThreads) {
     constexpr int NUM_THREADS = 8;
@@ -53,13 +44,10 @@ TEST_F(ConcurrencyTest, ConcurrentConnectFromThreads) {
         << "Failures: " << failure_count.load();
 }
 
-// ---- Concurrent queries on separate connections ----
-
 TEST_F(ConcurrencyTest, ConcurrentQueriesOnSeparateConnections) {
     constexpr int NUM_THREADS = 4;
     constexpr int QUERIES_PER_THREAD = 20;
 
-    // Each thread gets its own connection
     std::vector<PGconn *> conns(NUM_THREADS);
     for (int i = 0; i < NUM_THREADS; i++) {
         conns[i] = embed_pg_connect(srv(), "postgres", "postgres");
@@ -100,13 +88,10 @@ TEST_F(ConcurrencyTest, ConcurrentQueriesOnSeparateConnections) {
     EXPECT_EQ(total_success.load(), NUM_THREADS * QUERIES_PER_THREAD);
 }
 
-// ---- Concurrent writes with isolation ----
-
 TEST_F(ConcurrencyTest, ConcurrentWritesIsolation) {
     constexpr int NUM_THREADS = 4;
     constexpr int ROWS_PER_THREAD = 50;
 
-    // Setup: create shared table
     TestConnection setup_conn(srv());
     ASSERT_TRUE(setup_conn.is_ok());
     PGresult *res = setup_conn.exec(
@@ -161,14 +146,12 @@ TEST_F(ConcurrencyTest, ConcurrentWritesIsolation) {
 
     EXPECT_EQ(errors.load(), 0);
 
-    // Verify total row count
     res = setup_conn.exec("SELECT count(*) FROM concurrent_writes");
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
     int expected_total = NUM_THREADS * ROWS_PER_THREAD;
     EXPECT_STREQ(PQgetvalue(res, 0, 0), std::to_string(expected_total).c_str());
     PQclear(res);
 
-    // Verify each thread's rows
     for (int t = 0; t < NUM_THREADS; t++) {
         std::ostringstream sql;
         sql << "SELECT count(*) FROM concurrent_writes WHERE thread_id = " << t;
@@ -181,8 +164,6 @@ TEST_F(ConcurrencyTest, ConcurrentWritesIsolation) {
 
     setup_conn.exec("DROP TABLE concurrent_writes");
 }
-
-// ---- Concurrent connect and disconnect from many threads ----
 
 TEST_F(ConcurrencyTest, ConcurrentConnectDisconnect) {
     constexpr int NUM_THREADS = 10;
@@ -221,8 +202,6 @@ TEST_F(ConcurrencyTest, ConcurrentConnectDisconnect) {
     EXPECT_EQ(success.load(), NUM_THREADS * ITERATIONS);
 }
 
-// ---- Reader-writer concurrency: one writer, multiple readers ----
-
 TEST_F(ConcurrencyTest, ReaderWriterConcurrency) {
     TestConnection setup(srv());
     ASSERT_TRUE(setup.is_ok());
@@ -235,7 +214,6 @@ TEST_F(ConcurrencyTest, ReaderWriterConcurrency) {
     std::atomic<int> write_count{0};
     std::atomic<int> read_count{0};
 
-    // Writer thread
     auto writer = [&]() {
         PGconn *conn = embed_pg_connect(srv(), "postgres", "postgres");
         if (!conn || PQstatus(conn) != CONNECTION_OK) {
@@ -256,7 +234,6 @@ TEST_F(ConcurrencyTest, ReaderWriterConcurrency) {
         PQfinish(conn);
     };
 
-    // Reader threads
     auto reader = [&]() {
         PGconn *conn = embed_pg_connect(srv(), "postgres", "postgres");
         if (!conn || PQstatus(conn) != CONNECTION_OK) {
@@ -268,7 +245,7 @@ TEST_F(ConcurrencyTest, ReaderWriterConcurrency) {
             PGresult *r = PQexec(conn, "SELECT count(*) FROM rw_test");
             if (PQresultStatus(r) == PGRES_TUPLES_OK) {
                 int count = atoi(PQgetvalue(r, 0, 0));
-                (void)count;  // Just verify the query works
+                (void) count;
                 read_count++;
             }
             PQclear(r);

@@ -1,13 +1,4 @@
-/*
- * Demo application for embedded PostgreSQL server library.
- *
- * Demonstrates:
- * 1. Running two independent PostgreSQL instances concurrently
- * 2. Each instance has its own data directory and state
- * 3. Data written to one instance is invisible to the other
- * 4. Both instances handle connections via the embed API
- * 5. Clean parallel shutdown
- */
+/* Demo: two independent PostgreSQL instances running side by side */
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,13 +9,26 @@ extern "C" {
 #include "embed_postgres.h"
 }
 
+/* Owns a server handle; embed_pg_destroy() stops it if it is still running */
+class Server {
+public:
+    explicit Server(embed_pg_server *srv) : srv_(srv) {}
+    ~Server() { if (srv_) embed_pg_destroy(srv_); }
+
+    Server(const Server &) = delete;
+    Server &operator=(const Server &) = delete;
+
+    embed_pg_server *get() const { return srv_; }
+    bool valid() const { return srv_ != nullptr; }
+    int stop() { return embed_pg_stop(srv_); }
+
+private:
+    embed_pg_server *srv_;
+};
+
 static const char *DATA_DIR_A = "/tmp/embed_pg_data_A";
 static const char *DATA_DIR_B = "/tmp/embed_pg_data_B";
 
-/*
- * Initialize a data directory if it doesn't exist yet.
- * Returns 0 on success.
- */
 static int
 init_data_dir(const char *data_dir, const char *pg_share)
 {
@@ -47,10 +51,6 @@ init_data_dir(const char *data_dir, const char *pg_share)
     return rc;
 }
 
-/*
- * Start a server instance and return it (already past fork, not yet ready).
- * Returns NULL on failure.
- */
 static embed_pg_server *
 start_server(const char *data_dir, const char *pg_share, const char *label)
 {
@@ -84,70 +84,51 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* ------------------------------------------------------------------ */
     printf("=== Step 1: Initialize two independent data directories ===\n");
     if (init_data_dir(DATA_DIR_A, pg_share) != 0) return 1;
     if (init_data_dir(DATA_DIR_B, pg_share) != 0) return 1;
     printf("\n");
 
-    /* ------------------------------------------------------------------ */
     printf("=== Step 2: Fork both server processes (parallel startup) ===\n");
-    embed_pg_server *srv_a = start_server(DATA_DIR_A, pg_share, "A");
-    embed_pg_server *srv_b = start_server(DATA_DIR_B, pg_share, "B");
-    if (!srv_a || !srv_b) {
-        if (srv_a) embed_pg_destroy(srv_a);
-        if (srv_b) embed_pg_destroy(srv_b);
+    Server srv_a(start_server(DATA_DIR_A, pg_share, "A"));
+    Server srv_b(start_server(DATA_DIR_B, pg_share, "B"));
+    if (!srv_a.valid() || !srv_b.valid())
         return 1;
-    }
     printf("\n");
 
-    /* ------------------------------------------------------------------ */
     printf("=== Step 3: Wait for both servers to become ready ===\n");
-    int rc;
-    rc = embed_pg_wait_ready(srv_a, 30000);
-    if (rc != 0) {
+    if (embed_pg_wait_ready(srv_a.get(), 30000) != 0) {
         fprintf(stderr, "[A] Server did not become ready\n");
-        embed_pg_stop(srv_a); embed_pg_destroy(srv_a);
-        embed_pg_stop(srv_b); embed_pg_destroy(srv_b);
         return 1;
     }
     printf("[A] Ready!\n");
 
-    rc = embed_pg_wait_ready(srv_b, 30000);
-    if (rc != 0) {
+    if (embed_pg_wait_ready(srv_b.get(), 30000) != 0) {
         fprintf(stderr, "[B] Server did not become ready\n");
-        embed_pg_stop(srv_a); embed_pg_destroy(srv_a);
-        embed_pg_stop(srv_b); embed_pg_destroy(srv_b);
         return 1;
     }
     printf("[B] Ready!\n\n");
 
-    /* ------------------------------------------------------------------ */
     printf("=== Step 4: Connect to both instances ===\n");
-    PGconn *conn_a = embed_pg_connect(srv_a, "postgres", "postgres");
+    PGconn *conn_a = embed_pg_connect(srv_a.get(), "postgres", "postgres");
     if (!conn_a || PQstatus(conn_a) != CONNECTION_OK) {
         fprintf(stderr, "[A] Connection failed: %s\n",
                 conn_a ? PQerrorMessage(conn_a) : "NULL");
         if (conn_a) PQfinish(conn_a);
-        embed_pg_stop(srv_a); embed_pg_destroy(srv_a);
-        embed_pg_stop(srv_b); embed_pg_destroy(srv_b);
         return 1;
     }
     printf("[A] Connected! Backend PID: %d\n", PQbackendPID(conn_a));
 
-    PGconn *conn_b = embed_pg_connect(srv_b, "postgres", "postgres");
+    PGconn *conn_b = embed_pg_connect(srv_b.get(), "postgres", "postgres");
     if (!conn_b || PQstatus(conn_b) != CONNECTION_OK) {
         fprintf(stderr, "[B] Connection failed: %s\n",
                 conn_b ? PQerrorMessage(conn_b) : "NULL");
         if (conn_b) PQfinish(conn_b);
         PQfinish(conn_a);
-        embed_pg_stop(srv_a); embed_pg_destroy(srv_a);
-        embed_pg_stop(srv_b); embed_pg_destroy(srv_b);
         return 1;
     }
     printf("[B] Connected! Backend PID: %d\n\n", PQbackendPID(conn_b));
 
-    /* ------------------------------------------------------------------ */
     printf("=== Step 5: Verify both instances report their version ===\n");
     PGresult *res;
 
@@ -162,7 +143,6 @@ int main(int argc, char *argv[])
     PQclear(res);
     printf("\n");
 
-    /* ------------------------------------------------------------------ */
     printf("=== Step 6: Write different data to each instance ===\n");
 
     res = PQexec(conn_a,
@@ -186,7 +166,6 @@ int main(int argc, char *argv[])
     PQclear(res);
     printf("\n");
 
-    /* ------------------------------------------------------------------ */
     printf("=== Step 7: Verify data isolation (cross-check) ===\n");
 
     res = PQexec(conn_a, "SELECT value FROM items");
@@ -207,11 +186,10 @@ int main(int argc, char *argv[])
     printf("\n\n");
     PQclear(res);
 
-    /* ------------------------------------------------------------------ */
     printf("=== Step 8: Multiple connections per instance ===\n");
 
-    PGconn *conn_a2 = embed_pg_connect(srv_a, "postgres", "postgres");
-    PGconn *conn_b2 = embed_pg_connect(srv_b, "postgres", "postgres");
+    PGconn *conn_a2 = embed_pg_connect(srv_a.get(), "postgres", "postgres");
+    PGconn *conn_b2 = embed_pg_connect(srv_b.get(), "postgres", "postgres");
 
     if (conn_a2 && PQstatus(conn_a2) == CONNECTION_OK) {
         res = PQexec(conn_a2, "SELECT count(*) FROM items");
@@ -231,19 +209,12 @@ int main(int argc, char *argv[])
     }
     printf("\n");
 
-    /* ------------------------------------------------------------------ */
     printf("=== Step 9: Shutdown both instances ===\n");
     PQfinish(conn_a);
     PQfinish(conn_b);
 
-    int exit_a = embed_pg_stop(srv_a);
-    printf("[A] Server stopped (exit code: %d)\n", exit_a);
-
-    int exit_b = embed_pg_stop(srv_b);
-    printf("[B] Server stopped (exit code: %d)\n", exit_b);
-
-    embed_pg_destroy(srv_a);
-    embed_pg_destroy(srv_b);
+    printf("[A] Server stopped (exit code: %d)\n", srv_a.stop());
+    printf("[B] Server stopped (exit code: %d)\n", srv_b.stop());
 
     printf("\nDone! Two independent PostgreSQL instances ran concurrently.\n");
     return 0;

@@ -8,7 +8,6 @@ extern "C" {
 #include "embed_postgres.h"
 }
 
-// RAII wrapper for temporary data directory
 class TempDataDir {
 public:
     TempDataDir();
@@ -19,11 +18,13 @@ public:
 
     const std::string &path() const { return path_; }
 
+    // Defaults pointing at this directory; valid while the object lives
+    embed_pg_options options() const;
+
 private:
     std::string path_;
 };
 
-// RAII wrapper for full server lifecycle
 class TestServer {
 public:
     TestServer();
@@ -41,7 +42,6 @@ private:
     bool valid_ = false;
 };
 
-// RAII wrapper for PGconn
 class TestConnection {
 public:
     TestConnection(embed_pg_server *srv,
@@ -60,16 +60,15 @@ private:
     PGconn *conn_;
 };
 
-// Get the PG share directory from env or compile-time define
+// NOTIFY delivery is asynchronous — the notifying backend commits, signals the
+// listening backend, and only then does that backend write to its socket — so a
+// single PQconsumeInput() after the NOTIFY usually finds nothing yet.
+// Returns NULL on timeout; the caller must PQfreemem() the result.
+PGnotify *wait_for_notify(PGconn *conn, int timeout_ms);
+
 const char *get_pg_share_dir();
 
-// Get the PG bin directory from env or compile-time define
-const char *get_pg_bin_dir();
-
-// Run external initdb binary to initialize a data directory. Returns 0 on success.
-int run_external_initdb(const char *data_dir, const char *share_dir);
-
-// gtest fixture sharing one server across all tests in a file
+// One server shared by every test in a file
 class EmbedPgTest : public ::testing::Test {
 protected:
     static void SetUpTestSuite();

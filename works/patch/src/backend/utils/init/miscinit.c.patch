@@ -1,0 +1,18 @@
+diff --git a/src/backend/utils/init/miscinit.c b/src/backend/utils/init/miscinit.c
+index ba19197..c44494e 100644
+--- a/src/backend/utils/init/miscinit.c
++++ b/src/backend/utils/init/miscinit.c
+@@ -98,6 +98,13 @@ InitPostmasterChild(void)
+ {
+ 	IsUnderPostmaster = true;	/* we are a postmaster subprocess now */
+ 
++	/*
++	 * The parent's channel to the embed host came with the fork, and two
++	 * processes reading one socket would take each other's replies; open our
++	 * own on next use.
++	 */
++	embed_vfs_reset_after_fork();
++
+ 	/*
+ 	 * Start our win32 signal implementation. This has to be done after we
+ 	 * read the backend variables, because we need to pick up the signal pipe

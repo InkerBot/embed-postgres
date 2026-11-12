@@ -1,0 +1,1451 @@
+diff --git a/src/port/embed_vfs.c b/src/port/embed_vfs.c
+new file mode 100644
+index 0000000..93d90d7
+--- /dev/null
++++ b/src/port/embed_vfs.c
+@@ -0,0 +1,1445 @@
++/*-------------------------------------------------------------------------
++ *
++ * embed_vfs.c
++ *	  Client side of the host-resolved file system.
++ *
++ * See embed_vfs.h for what this is.  Every entry point here answers the same
++ * question first: is this ours?  A path is ours whenever a host is listening; a
++ * descriptor is ours only when it was wrapped around one of the host's handles.
++ * Anything else goes to the kernel untouched, which is what lets the postmaster
++ * keep its sockets and pipes while its files come from somewhere else entirely.
++ *
++ * IDENTIFICATION
++ *	  src/port/embed_vfs.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#define EMBED_VFS_NO_REDIRECT
++
++#include "c.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stdarg.h>
++#include <stdlib.h>
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/uio.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++#include "embed_vfs.h"
++
++/*
++ * An open file: the host's handle, plus what this side has to remember for the
++ * interfaces the host does not see — the seek position, and the name, which
++ * every callback is given.
++ */
++typedef struct EmbedVfsFile
++{
++	bool		inuse;
++	bool		isdir;
++	FILE	   *stream;			/* set when reached through fopen() */
++	unsigned long long fh;
++	off_t		position;
++	long long	dirindex;
++	char		path[EMBED_VFS_PATH_MAX];
++} EmbedVfsFile;
++
++#define EMBED_VFS_MAX_FILES 4096
++
++static EmbedVfsFile vfs_files[EMBED_VFS_MAX_FILES];
++
++/*
++ * The socket this process rings the host on: -1 before the first use and in a
++ * process that has just forked, -2 once we know there is no host to talk to.
++ */
++static int	vfs_fd = -1;
++
++/* The memory every exchange happens in, shared with the host; see embed_vfs.h */
++static EmbedVfsShared *vfs_shared;
++
++/* The directory PostgreSQL believes it is in; see vfs_absolute() */
++static char vfs_cwd[EMBED_VFS_PATH_MAX];
++
++static EmbedVfsFile *
++vfs_lookup(int fd)
++{
++	int			slot = fd - EMBED_VFS_FD_BASE;
++
++	if (slot < 0 || slot >= EMBED_VFS_MAX_FILES || !vfs_files[slot].inuse)
++		return NULL;
++	return &vfs_files[slot];
++}
++
++static int
++vfs_alloc(void)
++{
++	for (int i = 0; i < EMBED_VFS_MAX_FILES; i++)
++	{
++		if (!vfs_files[i].inuse)
++		{
++			memset(&vfs_files[i], 0, sizeof(vfs_files[i]));
++			vfs_files[i].inuse = true;
++			return EMBED_VFS_FD_BASE + i;
++		}
++	}
++	return -1;
++}
++
++static void
++vfs_free(int fd)
++{
++	EmbedVfsFile *file = vfs_lookup(fd);
++
++	if (file)
++		file->inuse = false;
++}
++
++/*
++ * Wait for the host's byte, and for the descriptor that may come with it.
++ * Returns the byte, or -1 when the channel failed.
++ */
++static int
++vfs_wait(int fd, int *fd_out)
++{
++	struct msghdr msg;
++	struct iovec iov;
++	struct cmsghdr *cmsg;
++	char		cmsgbuf[CMSG_SPACE(sizeof(int))];
++	char		byte;
++	ssize_t		n;
++
++	*fd_out = -1;
++
++	iov.iov_base = &byte;
++	iov.iov_len = 1;
++	memset(&msg, 0, sizeof(msg));
++	msg.msg_iov = &iov;
++	msg.msg_iovlen = 1;
++	msg.msg_control = cmsgbuf;
++	msg.msg_controllen = sizeof(cmsgbuf);
++
++	do
++	{
++		n = recvmsg(fd, &msg, 0);
++	} while (n < 0 && errno == EINTR);
++	if (n != 1)
++		return -1;
++
++	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
++		 cmsg = CMSG_NXTHDR(&msg, cmsg))
++	{
++		if (cmsg->cmsg_level == SOL_SOCKET &&
++			cmsg->cmsg_type == SCM_RIGHTS &&
++			cmsg->cmsg_len == CMSG_LEN(sizeof(int)))
++		{
++			memcpy(fd_out, CMSG_DATA(cmsg), sizeof(int));
++			break;
++		}
++	}
++	if (msg.msg_flags & MSG_CTRUNC)
++	{
++		if (*fd_out >= 0)
++			close(*fd_out);
++		*fd_out = -1;
++		return -1;
++	}
++	return (unsigned char) byte;
++}
++
++/*
++ * Take the region the host offers on a new connection.  Anything but a region
++ * of the layout this side was built with is refused: a host speaking another
++ * version would be misread silently.
++ */
++static EmbedVfsShared *
++vfs_attach(int fd)
++{
++	int			region;
++	struct stat st;
++	void	   *mem;
++
++	if (vfs_wait(fd, &region) != EMBED_VFS_MSG_HELLO || region < 0)
++	{
++		if (region >= 0)
++			close(region);
++		return NULL;
++	}
++
++	if (fstat(region, &st) < 0 || st.st_size < (off_t) sizeof(EmbedVfsShared))
++	{
++		close(region);
++		return NULL;
++	}
++	mem = mmap(NULL, sizeof(EmbedVfsShared), PROT_READ | PROT_WRITE,
++			   MAP_SHARED, region, 0);
++	close(region);
++	if (mem == MAP_FAILED)
++		return NULL;
++
++	if (((EmbedVfsShared *) mem)->magic != EMBED_VFS_MAGIC ||
++		((EmbedVfsShared *) mem)->version != EMBED_VFS_VERSION)
++	{
++		munmap(mem, sizeof(EmbedVfsShared));
++		return NULL;
++	}
++	return (EmbedVfsShared *) mem;
++}
++
++/*
++ * The channel for this process, opened on first use.
++ *
++ * Each process connects for itself rather than sharing an inherited socket: the
++ * host then gives each its own region and its own thread, so no process can
++ * overwrite another's request and no locking is needed to prevent it.
++ */
++static int
++vfs_channel(void)
++{
++	const char *path;
++	struct sockaddr_un addr;
++	int			fd;
++
++	if (vfs_fd >= 0)
++		return vfs_fd;
++	if (vfs_fd == -2)
++		return -1;
++
++	path = getenv("EMBED_VFS_SOCK");
++	if (path == NULL || *path == '\0' || strlen(path) >= sizeof(addr.sun_path))
++	{
++		vfs_fd = -2;
++		return -1;
++	}
++
++	fd = socket(AF_UNIX, SOCK_STREAM, 0);
++	if (fd < 0)
++	{
++		vfs_fd = -2;
++		return -1;
++	}
++
++	memset(&addr, 0, sizeof(addr));
++	addr.sun_family = AF_UNIX;
++	strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
++
++	if (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0 ||
++		(vfs_shared = vfs_attach(fd)) == NULL)
++	{
++		close(fd);
++		vfs_fd = -2;
++		return -1;
++	}
++
++	fcntl(fd, F_SETFD, FD_CLOEXEC);
++	vfs_fd = fd;
++	return vfs_fd;
++}
++
++static void
++vfs_disconnect(void)
++{
++	if (vfs_shared != NULL)
++		munmap(vfs_shared, sizeof(EmbedVfsShared));
++	vfs_shared = NULL;
++	if (vfs_fd >= 0)
++		close(vfs_fd);
++}
++
++/*
++ * The region matters as much as the socket here: it is mapped shared, so a
++ * child still holding it would write its requests over its parent's.
++ */
++void
++embed_vfs_reset_after_fork(void)
++{
++	vfs_disconnect();
++	vfs_fd = -1;
++}
++
++/* The host is unreachable; stop pretending it is there */
++static void
++vfs_lost(void)
++{
++	vfs_disconnect();
++	vfs_fd = -2;
++}
++
++/*
++ * Hand the request already laid out in the region to the host, and wait until
++ * its reply is there.  Returns -1 when the channel itself failed, which callers
++ * treat as the host being gone: a half-spoken protocol is worse than none.
++ */
++static int
++vfs_ring(int *fd_out)
++{
++	char		byte = EMBED_VFS_MSG_REQUEST;
++	int			passed;
++	ssize_t		n;
++
++	do
++	{
++		n = send(vfs_fd, &byte, 1, 0);
++	} while (n < 0 && errno == EINTR);
++	if (n != 1)
++		return -1;
++
++	if (vfs_wait(vfs_fd, &passed) != EMBED_VFS_MSG_REPLY)
++	{
++		if (passed >= 0)
++			close(passed);
++		return -1;
++	}
++
++	/* A descriptor comes only with an open; any other would leak */
++	if (fd_out)
++		*fd_out = passed;
++	else if (passed >= 0)
++		close(passed);
++	return 0;
++}
++
++/*
++ * PostgreSQL chdir()s into the data directory and then names most files
++ * relative to it, but the host resolves paths in a namespace of its own, where
++ * this process's working directory means nothing.  Relative names are therefore
++ * made absolute before they are sent.
++ */
++static const char *
++vfs_absolute(const char *path, char *buf, size_t len)
++{
++	if (path == NULL || path[0] == '/' || vfs_cwd[0] == '\0')
++		return path;
++
++	if (path[0] == '.' && path[1] == '/')
++		path += 2;
++	snprintf(buf, len, "%s/%s", vfs_cwd, path);
++	return buf;
++}
++
++/*
++ * Ask the host to do something.  Returns 1 when it answered, with the outcome
++ * in `reply`; 0 when there is no host and the caller should do the work itself.
++ *
++ * `out` goes to the host and `in` receives what it sends back; neither may be
++ * larger than EMBED_VFS_IO_MAX, which the callers see to.
++ */
++static int
++vfs_perform(int op, const char *path, const char *path2,
++			EmbedVfsRequest *req, EmbedVfsReply *reply,
++			const void *out, size_t outlen, void *in, size_t inlen,
++			int *fd_out)
++{
++	char		abs1[EMBED_VFS_PATH_MAX];
++	char		abs2[EMBED_VFS_PATH_MAX];
++	EmbedVfsShared *sh;
++
++	if (fd_out)
++		*fd_out = -1;
++	if (vfs_channel() < 0)
++		return 0;
++
++	path = vfs_absolute(path, abs1, sizeof(abs1));
++	path2 = vfs_absolute(path2, abs2, sizeof(abs2));
++
++	if ((path && strlen(path) >= EMBED_VFS_PATH_MAX) ||
++		(path2 && strlen(path2) >= EMBED_VFS_PATH_MAX))
++	{
++		reply->result = -1;
++		reply->err = ENAMETOOLONG;
++		return 1;
++	}
++
++	sh = vfs_shared;
++	req->op = op;
++	sh->req = *req;
++	strlcpy(sh->path, path ? path : "", EMBED_VFS_PATH_MAX);
++	strlcpy(sh->path2, path2 ? path2 : "", EMBED_VFS_PATH_MAX);
++	if (outlen > 0)
++		memcpy(sh->data, out, outlen);
++
++	if (vfs_ring(fd_out) < 0)
++	{
++		vfs_lost();
++		reply->result = -1;
++		reply->err = EIO;
++		return 1;
++	}
++
++	*reply = sh->reply;
++	if (inlen > 0 && reply->result == 0 && reply->length > 0)
++		memcpy(in, sh->data, Min((size_t) reply->length, inlen));
++	return 1;
++}
++
++/* Shorthand for the many operations that carry nothing but a path */
++static int
++vfs_simple(int op, const char *path, const char *path2,
++		   EmbedVfsRequest *req, EmbedVfsReply *reply)
++{
++	return vfs_perform(op, path, path2, req, reply, NULL, 0, NULL, 0, NULL);
++}
++
++static int
++vfs_finish(const EmbedVfsReply *reply)
++{
++	if (reply->result != 0)
++	{
++		errno = reply->err;
++		return -1;
++	}
++	return 0;
++}
++
++/* Remember the name a handle was opened under, absolute as the host sees it */
++static void
++vfs_remember_path(EmbedVfsFile *file, const char *path)
++{
++	char		abs[EMBED_VFS_PATH_MAX];
++
++	strlcpy(file->path, vfs_absolute(path, abs, sizeof(abs)),
++			sizeof(file->path));
++}
++
++#define VFS_REQ(r)	EmbedVfsRequest r = {0}
++
++/* ----------------------------------------------------------------
++ * Names
++ * ---------------------------------------------------------------- */
++
++static void
++vfs_fill_stat(const EmbedVfsReply *reply, struct stat *st)
++{
++	memset(st, 0, sizeof(*st));
++	st->st_size = (off_t) reply->size;
++	st->st_mtime = (time_t) reply->mtime;
++	st->st_atime = (time_t) reply->atime;
++	st->st_ctime = (time_t) reply->ctime;
++	st->st_mode = (mode_t) reply->mode;
++	st->st_nlink = (nlink_t) reply->nlink;
++	st->st_uid = (uid_t) reply->uid;
++	st->st_gid = (gid_t) reply->gid;
++	st->st_blocks = (blkcnt_t) reply->blocks;
++
++	/*
++	 * The backend identifies a loaded library by device and inode, so these
++	 * have to be real: left at zero, every shared library looks like the same
++	 * file and the first one loaded answers for all of them.
++	 */
++	st->st_dev = (dev_t) reply->dev;
++	st->st_ino = (ino_t) reply->ino;
++}
++
++int
++embed_vfs_stat(const char *path, struct stat *st)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	if (!vfs_simple(EMBED_VFS_OP_GETATTR, path, NULL, &req, &reply))
++		return stat(path, st);
++	if (vfs_finish(&reply) < 0)
++		return -1;
++	vfs_fill_stat(&reply, st);
++	return 0;
++}
++
++/*
++ * A host that models symlinks can tell the two apart by the flag; one that does
++ * not is answering the same question either way.
++ */
++int
++embed_vfs_lstat(const char *path, struct stat *st)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	req.flags = 1;				/* do not follow */
++	if (!vfs_simple(EMBED_VFS_OP_GETATTR, path, NULL, &req, &reply))
++		return lstat(path, st);
++	if (vfs_finish(&reply) < 0)
++		return -1;
++	vfs_fill_stat(&reply, st);
++	return 0;
++}
++
++int
++embed_vfs_fstat(int fd, struct stat *st)
++{
++	EmbedVfsFile *file = vfs_lookup(fd);
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	if (file == NULL)
++		return fstat(fd, st);
++
++	req.fh = file->fh;
++	if (!vfs_simple(EMBED_VFS_OP_GETATTR, file->path, NULL, &req, &reply))
++	{
++		errno = EBADF;
++		return -1;
++	}
++	if (vfs_finish(&reply) < 0)
++		return -1;
++	vfs_fill_stat(&reply, st);
++	return 0;
++}
++
++int
++embed_vfs_statvfs(const char *path, struct statvfs *buf)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	if (!vfs_simple(EMBED_VFS_OP_STATFS, path, NULL, &req, &reply))
++		return statvfs(path, buf);
++	if (vfs_finish(&reply) < 0)
++		return -1;
++
++	memset(buf, 0, sizeof(*buf));
++	buf->f_bsize = (unsigned long) reply.f_bsize;
++	buf->f_frsize = (unsigned long) reply.f_bsize;
++	buf->f_blocks = (fsblkcnt_t) reply.f_blocks;
++	buf->f_bfree = (fsblkcnt_t) reply.f_bfree;
++	buf->f_bavail = (fsblkcnt_t) reply.f_bavail;
++	buf->f_files = (fsfilcnt_t) reply.f_files;
++	buf->f_ffree = (fsfilcnt_t) reply.f_ffree;
++	return 0;
++}
++
++int
++embed_vfs_unlink(const char *path)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	if (!vfs_simple(EMBED_VFS_OP_UNLINK, path, NULL, &req, &reply))
++		return unlink(path);
++	return vfs_finish(&reply);
++}
++
++int
++embed_vfs_mkdir(const char *path, mode_t mode)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	req.mode = mode;
++	if (!vfs_simple(EMBED_VFS_OP_MKDIR, path, NULL, &req, &reply))
++		return mkdir(path, mode);
++	return vfs_finish(&reply);
++}
++
++int
++embed_vfs_rmdir(const char *path)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	if (!vfs_simple(EMBED_VFS_OP_RMDIR, path, NULL, &req, &reply))
++		return rmdir(path);
++	return vfs_finish(&reply);
++}
++
++int
++embed_vfs_rename(const char *from, const char *to)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	if (!vfs_simple(EMBED_VFS_OP_RENAME, from, to, &req, &reply))
++		return rename(from, to);
++	return vfs_finish(&reply);
++}
++
++int
++embed_vfs_link(const char *from, const char *to)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	if (!vfs_simple(EMBED_VFS_OP_LINK, from, to, &req, &reply))
++		return link(from, to);
++	return vfs_finish(&reply);
++}
++
++int
++embed_vfs_access(const char *path, int mode)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	req.flags = mode;
++	if (!vfs_simple(EMBED_VFS_OP_ACCESS, path, NULL, &req, &reply))
++		return access(path, mode);
++	return vfs_finish(&reply);
++}
++
++int
++embed_vfs_chmod(const char *path, mode_t mode)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	req.mode = mode;
++	if (!vfs_simple(EMBED_VFS_OP_CHMOD, path, NULL, &req, &reply))
++		return chmod(path, mode);
++	return vfs_finish(&reply);
++}
++
++int
++embed_vfs_symlink(const char *target, const char *linkpath)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	if (!vfs_simple(EMBED_VFS_OP_SYMLINK, target, linkpath, &req, &reply))
++		return symlink(target, linkpath);
++	return vfs_finish(&reply);
++}
++
++ssize_t
++embed_vfs_readlink(const char *path, char *buf, size_t len)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	if (len > EMBED_VFS_PATH_MAX)
++		len = EMBED_VFS_PATH_MAX;
++	if (!vfs_perform(EMBED_VFS_OP_READLINK, path, NULL, &req, &reply,
++					 NULL, 0, buf, len, NULL))
++		return readlink(path, buf, len);
++	if (vfs_finish(&reply) < 0)
++		return -1;
++	return (ssize_t) Min((size_t) reply.length, len);
++}
++
++int
++embed_vfs_truncate(const char *path, off_t length)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	req.length = length;
++	if (!vfs_simple(EMBED_VFS_OP_TRUNCATE, path, NULL, &req, &reply))
++		return truncate(path, length);
++	return vfs_finish(&reply);
++}
++
++/* Returns 1 when there is no host, so the caller can fall through */
++static int
++vfs_utimens(const char *path, long long atime, long long mtime)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	req.offset = atime;
++	req.length = mtime;
++	if (!vfs_simple(EMBED_VFS_OP_UTIMENS, path, NULL, &req, &reply))
++		return 1;
++	return vfs_finish(&reply);
++}
++
++int
++embed_vfs_utime(const char *path, const struct utimbuf *times)
++{
++	int			rc = vfs_utimens(path,
++								 times ? (long long) times->actime : 0,
++								 times ? (long long) times->modtime : 0);
++
++	return rc == 1 ? utime(path, times) : rc;
++}
++
++int
++embed_vfs_utimes(const char *path, const struct timeval *times)
++{
++	int			rc = vfs_utimens(path,
++								 times ? (long long) times[0].tv_sec : 0,
++								 times ? (long long) times[1].tv_sec : 0);
++
++	return rc == 1 ? utimes(path, times) : rc;
++}
++
++/*
++ * Remember the name PostgreSQL used, so that later relative paths can be
++ * rebuilt from it.  The kernel's idea of the working directory is left alone:
++ * it is only consulted for paths this file no longer lets through.
++ */
++int
++embed_vfs_chdir(const char *path)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++	char		abs[EMBED_VFS_PATH_MAX];
++	struct stat st;
++
++	if (!vfs_simple(EMBED_VFS_OP_GETATTR, path, NULL, &req, &reply))
++		return chdir(path);
++	if (vfs_finish(&reply) < 0)
++		return -1;
++
++	vfs_fill_stat(&reply, &st);
++	if (!S_ISDIR(st.st_mode))
++	{
++		errno = ENOTDIR;
++		return -1;
++	}
++
++	if (path[0] == '/')
++		strlcpy(vfs_cwd, path, sizeof(vfs_cwd));
++	else
++	{
++		snprintf(abs, sizeof(abs), "%s/%s", vfs_cwd, path);
++		strlcpy(vfs_cwd, abs, sizeof(vfs_cwd));
++	}
++	return 0;
++}
++
++/* The name PostgreSQL knows this directory by, not the one the kernel has */
++char *
++embed_vfs_getcwd(char *buf, size_t size)
++{
++	if (vfs_cwd[0] == '\0')
++		return getcwd(buf, size);
++
++	if (strlen(vfs_cwd) >= size)
++	{
++		errno = ERANGE;
++		return NULL;
++	}
++	strlcpy(buf, vfs_cwd, size);
++	return buf;
++}
++
++/* ----------------------------------------------------------------
++ * Open files
++ * ---------------------------------------------------------------- */
++
++int
++embed_vfs_open(const char *path, int flags, ...)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++	mode_t		mode = 0;
++	int			fd;
++	int			hostfd = -1;
++	EmbedVfsFile *file;
++
++	if (flags & O_CREAT)
++	{
++		va_list		ap;
++
++		va_start(ap, flags);
++		mode = (mode_t) va_arg(ap, int);
++		va_end(ap);
++	}
++
++	req.flags = flags;
++	req.mode = mode;
++	if (!vfs_perform((flags & O_CREAT) ? EMBED_VFS_OP_CREATE : EMBED_VFS_OP_OPEN,
++					 path, NULL, &req, &reply, NULL, 0, NULL, 0, &hostfd))
++		return open(path, flags, mode);
++
++	if (vfs_finish(&reply) < 0)
++		return -1;
++
++	/*
++	 * The filesystem gave us the file itself.  Nothing about it is ours to
++	 * track: it is a real descriptor, and every later call goes to the kernel.
++	 */
++	if (reply.has_fd && hostfd >= 0)
++		return hostfd;
++
++	fd = vfs_alloc();
++	if (fd < 0)
++	{
++		VFS_REQ(rel);
++		EmbedVfsReply relreply;
++
++		rel.fh = reply.fh;
++		vfs_simple(EMBED_VFS_OP_RELEASE, path, NULL, &rel, &relreply);
++		errno = EMFILE;
++		return -1;
++	}
++
++	file = vfs_lookup(fd);
++	file->fh = reply.fh;
++	file->position = (flags & O_APPEND) ? (off_t) reply.size : 0;
++	vfs_remember_path(file, path);
++	return fd;
++}
++
++int
++embed_vfs_close(int fd)
++{
++	EmbedVfsFile *file = vfs_lookup(fd);
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++	int			rc;
++
++	if (file == NULL)
++		return close(fd);
++
++	req.fh = file->fh;
++	vfs_simple(file->isdir ? EMBED_VFS_OP_RELEASEDIR : EMBED_VFS_OP_RELEASE,
++			   file->path, NULL, &req, &reply);
++	rc = vfs_finish(&reply);
++	vfs_free(fd);
++	return rc;
++}
++
++ssize_t
++embed_vfs_pread(int fd, void *buf, size_t count, off_t offset)
++{
++	EmbedVfsFile *file = vfs_lookup(fd);
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	if (file == NULL)
++		return pread(fd, buf, count, offset);
++
++	if (count > EMBED_VFS_IO_MAX)
++		count = EMBED_VFS_IO_MAX;
++
++	req.fh = file->fh;
++	req.offset = offset;
++	req.length = (long long) count;
++	if (!vfs_perform(EMBED_VFS_OP_READ, file->path, NULL, &req, &reply,
++					 NULL, 0, buf, count, NULL))
++	{
++		errno = EBADF;
++		return -1;
++	}
++	if (vfs_finish(&reply) < 0)
++		return -1;
++	return (ssize_t) reply.length;
++}
++
++ssize_t
++embed_vfs_pwrite(int fd, const void *buf, size_t count, off_t offset)
++{
++	EmbedVfsFile *file = vfs_lookup(fd);
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	if (file == NULL)
++		return pwrite(fd, buf, count, offset);
++
++	if (count > EMBED_VFS_IO_MAX)
++		count = EMBED_VFS_IO_MAX;
++
++	req.fh = file->fh;
++	req.offset = offset;
++	req.length = (long long) count;
++	if (!vfs_perform(EMBED_VFS_OP_WRITE, file->path, NULL, &req, &reply,
++					 buf, count, NULL, 0, NULL))
++	{
++		errno = EBADF;
++		return -1;
++	}
++	if (vfs_finish(&reply) < 0)
++		return -1;
++	return (ssize_t) reply.length;
++}
++
++ssize_t
++embed_vfs_read(int fd, void *buf, size_t count)
++{
++	EmbedVfsFile *file = vfs_lookup(fd);
++	ssize_t		n;
++
++	if (file == NULL)
++		return read(fd, buf, count);
++
++	n = embed_vfs_pread(fd, buf, count, file->position);
++	if (n > 0)
++		file->position += n;
++	return n;
++}
++
++ssize_t
++embed_vfs_write(int fd, const void *buf, size_t count)
++{
++	EmbedVfsFile *file = vfs_lookup(fd);
++	ssize_t		n;
++
++	if (file == NULL)
++		return write(fd, buf, count);
++
++	n = embed_vfs_pwrite(fd, buf, count, file->position);
++	if (n > 0)
++		file->position += n;
++	return n;
++}
++
++/*
++ * The whole vector in one exchange.
++ *
++ * PostgreSQL reads ahead in vectors of 8kB pages, so asking per element would
++ * turn one sequential read into a dozen round trips.  The host fills the region
++ * and the pages are scattered straight from there into the caller's buffers.
++ */
++ssize_t
++embed_vfs_preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset)
++{
++	EmbedVfsFile *file = vfs_lookup(fd);
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++	size_t		total = 0;
++	size_t		done = 0;
++
++	if (file == NULL)
++		return preadv(fd, iov, iovcnt, offset);
++
++	for (int i = 0; i < iovcnt; i++)
++		total += iov[i].iov_len;
++	if (total > EMBED_VFS_IO_MAX)
++		total = EMBED_VFS_IO_MAX;
++
++	req.fh = file->fh;
++	req.offset = offset;
++	req.length = (long long) total;
++	if (!vfs_perform(EMBED_VFS_OP_READ, file->path, NULL, &req, &reply,
++					 NULL, 0, NULL, 0, NULL))
++	{
++		errno = EBADF;
++		return -1;
++	}
++	if (vfs_finish(&reply) < 0)
++		return -1;
++
++	total = Min((size_t) reply.length, total);
++	for (int i = 0; i < iovcnt && done < total; i++)
++	{
++		size_t		n = Min(iov[i].iov_len, total - done);
++
++		memcpy(iov[i].iov_base, vfs_shared->data + done, n);
++		done += n;
++	}
++	return (ssize_t) done;
++}
++
++/*
++ * The counterpart of embed_vfs_preadv(): the vector is gathered into the region
++ * and written in one exchange.  Past EMBED_VFS_IO_MAX the write comes up short,
++ * which callers already have to allow for.
++ */
++ssize_t
++embed_vfs_pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset)
++{
++	EmbedVfsFile *file = vfs_lookup(fd);
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++	size_t		total = 0;
++
++	if (file == NULL)
++		return pwritev(fd, iov, iovcnt, offset);
++	if (vfs_channel() < 0)
++	{
++		errno = EBADF;
++		return -1;
++	}
++
++	for (int i = 0; i < iovcnt && total < EMBED_VFS_IO_MAX; i++)
++	{
++		size_t		n = Min(iov[i].iov_len, EMBED_VFS_IO_MAX - total);
++
++		memcpy(vfs_shared->data + total, iov[i].iov_base, n);
++		total += n;
++	}
++
++	/* Already in place; vfs_perform() has nothing left to copy */
++	req.fh = file->fh;
++	req.offset = offset;
++	req.length = (long long) total;
++	if (!vfs_perform(EMBED_VFS_OP_WRITE, file->path, NULL, &req, &reply,
++					 NULL, 0, NULL, 0, NULL))
++	{
++		errno = EBADF;
++		return -1;
++	}
++	if (vfs_finish(&reply) < 0)
++		return -1;
++	return (ssize_t) reply.length;
++}
++
++off_t
++embed_vfs_lseek(int fd, off_t offset, int whence)
++{
++	EmbedVfsFile *file = vfs_lookup(fd);
++	struct stat st;
++
++	if (file == NULL)
++		return lseek(fd, offset, whence);
++
++	switch (whence)
++	{
++		case SEEK_SET:
++			file->position = offset;
++			break;
++		case SEEK_CUR:
++			file->position += offset;
++			break;
++		case SEEK_END:
++			if (embed_vfs_fstat(fd, &st) < 0)
++				return -1;
++			file->position = st.st_size + offset;
++			break;
++		default:
++			errno = EINVAL;
++			return -1;
++	}
++	return file->position;
++}
++
++static int
++vfs_sync(int fd, int datasync)
++{
++	EmbedVfsFile *file = vfs_lookup(fd);
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	if (file == NULL)
++		return datasync ? fdatasync(fd) : fsync(fd);
++
++	req.fh = file->fh;
++	req.flags = datasync;
++	if (!vfs_simple(EMBED_VFS_OP_FSYNC, file->path, NULL, &req, &reply))
++	{
++		errno = EBADF;
++		return -1;
++	}
++	return vfs_finish(&reply);
++}
++
++int
++embed_vfs_fsync(int fd)
++{
++	return vfs_sync(fd, 0);
++}
++
++int
++embed_vfs_fdatasync(int fd)
++{
++	return vfs_sync(fd, 1);
++}
++
++int
++embed_vfs_ftruncate(int fd, off_t length)
++{
++	EmbedVfsFile *file = vfs_lookup(fd);
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++
++	if (file == NULL)
++		return ftruncate(fd, length);
++
++	req.fh = file->fh;
++	req.length = length;
++	if (!vfs_simple(EMBED_VFS_OP_TRUNCATE, file->path, NULL, &req, &reply))
++	{
++		errno = EBADF;
++		return -1;
++	}
++	return vfs_finish(&reply);
++}
++
++/*
++ * Descriptor flags and locks are properties of this process, not of the file,
++ * and the host has no part in them.  Ours carry neither, so the answers are the
++ * ones a freshly opened, unlocked file would give.
++ */
++int
++embed_vfs_fcntl(int fd, int cmd, ...)
++{
++	va_list		ap;
++	void	   *arg;
++
++	va_start(ap, cmd);
++	arg = va_arg(ap, void *);
++	va_end(ap);
++
++	if (vfs_lookup(fd) == NULL)
++		return fcntl(fd, cmd, arg);
++
++	switch (cmd)
++	{
++		case F_GETFD:
++		case F_GETFL:
++		case F_SETFD:
++		case F_SETFL:
++			return 0;
++		default:
++			errno = EINVAL;
++			return -1;
++	}
++}
++
++int
++embed_vfs_dup(int fd)
++{
++	EmbedVfsFile *file = vfs_lookup(fd);
++	int			newfd;
++	EmbedVfsFile *copy;
++
++	if (file == NULL)
++		return dup(fd);
++
++	/*
++	 * Both descriptors end up on one handle, so the host sees a release for
++	 * each of them.  Nothing in the backend dups a data file and then keeps
++	 * using the original past its close.
++	 */
++	newfd = vfs_alloc();
++	if (newfd < 0)
++	{
++		errno = EMFILE;
++		return -1;
++	}
++	copy = vfs_lookup(newfd);
++	copy->fh = file->fh;
++	copy->isdir = file->isdir;
++	copy->position = file->position;
++	strlcpy(copy->path, file->path, sizeof(copy->path));
++	return newfd;
++}
++
++/* ----------------------------------------------------------------
++ * Directories
++ * ---------------------------------------------------------------- */
++
++/*
++ * A DIR of our own.  The real one cannot be used: it is built around a
++ * descriptor the kernel knows, and ours is not.
++ */
++typedef struct EmbedVfsDir
++{
++	int			fd;				/* our wrapped descriptor; must stay first */
++	struct dirent entry;
++
++	/*
++	 * Entries arrive in batches, and are kept here because the region is
++	 * overwritten by whatever the caller does between two readdir() calls.
++	 */
++	char	   *batch;
++	size_t		batch_len;
++	size_t		batch_pos;
++	bool		eof;
++} EmbedVfsDir;
++
++/* Ours were allocated here, so the wrapped descriptor inside identifies them */
++static bool
++vfs_is_dir(DIR *dir)
++{
++	EmbedVfsDir *d = (EmbedVfsDir *) dir;
++
++	return dir != NULL && vfs_lookup(d->fd) != NULL;
++}
++
++DIR *
++embed_vfs_opendir(const char *path)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++	EmbedVfsDir *dir;
++	EmbedVfsFile *file;
++	int			fd;
++
++	if (!vfs_simple(EMBED_VFS_OP_OPENDIR, path, NULL, &req, &reply))
++		return opendir(path);
++	if (vfs_finish(&reply) < 0)
++		return NULL;
++
++	fd = vfs_alloc();
++	if (fd < 0)
++	{
++		errno = EMFILE;
++		return NULL;
++	}
++	file = vfs_lookup(fd);
++	file->fh = reply.fh;
++	file->isdir = true;
++	vfs_remember_path(file, path);
++
++	dir = malloc(sizeof(*dir));
++	if (dir == NULL)
++	{
++		embed_vfs_close(fd);
++		errno = ENOMEM;
++		return NULL;
++	}
++	memset(dir, 0, sizeof(*dir));
++	dir->fd = fd;
++	return (DIR *) dir;
++}
++
++/* Fetch the batch that starts where the last one ended */
++static bool
++vfs_readdir_batch(EmbedVfsDir *d, EmbedVfsFile *file)
++{
++	VFS_REQ(req);
++	EmbedVfsReply reply;
++	size_t		len;
++
++	req.fh = file->fh;
++	req.index = file->dirindex;
++	if (!vfs_simple(EMBED_VFS_OP_READDIR, file->path, NULL, &req, &reply) ||
++		vfs_finish(&reply) < 0 || reply.length <= 0)
++		return false;			/* end of directory, or no way to go on */
++
++	len = Min((size_t) reply.length, (size_t) EMBED_VFS_DIR_BATCH);
++	if (d->batch == NULL)
++	{
++		d->batch = malloc(EMBED_VFS_DIR_BATCH);
++		if (d->batch == NULL)
++		{
++			errno = ENOMEM;
++			return false;
++		}
++	}
++	memcpy(d->batch, vfs_shared->data, len);
++	d->batch_len = len;
++	d->batch_pos = 0;
++	file->dirindex = reply.index;
++	return true;
++}
++
++struct dirent *
++embed_vfs_readdir(DIR *dir)
++{
++	EmbedVfsDir *d = (EmbedVfsDir *) dir;
++	EmbedVfsFile *file;
++	EmbedVfsDirent *ent;
++
++	if (!vfs_is_dir(dir))
++		return readdir(dir);
++
++	file = vfs_lookup(d->fd);
++	if (d->batch_pos >= d->batch_len)
++	{
++		if (d->eof || !vfs_readdir_batch(d, file))
++		{
++			d->eof = true;
++			return NULL;
++		}
++	}
++
++	ent = (EmbedVfsDirent *) (d->batch + d->batch_pos);
++	if (d->batch_len - d->batch_pos < sizeof(EmbedVfsDirent) ||
++		ent->reclen < sizeof(EmbedVfsDirent) ||
++		ent->reclen > d->batch_len - d->batch_pos ||
++		memchr(ent->name, '\0',
++			   ent->reclen - offsetof(EmbedVfsDirent, name)) == NULL)
++	{
++		/* A malformed batch; the rest of it cannot be trusted */
++		d->batch_pos = d->batch_len;
++		d->eof = true;
++		errno = EIO;
++		return NULL;
++	}
++	d->batch_pos += ent->reclen;
++
++	memset(&d->entry, 0, sizeof(d->entry));
++	strlcpy(d->entry.d_name, ent->name, sizeof(d->entry.d_name));
++	d->entry.d_ino = (ino_t) ent->ino;
++	d->entry.d_type = S_ISDIR(ent->mode) ? DT_DIR :
++		(S_ISLNK(ent->mode) ? DT_LNK : DT_REG);
++	return &d->entry;
++}
++
++int
++embed_vfs_closedir(DIR *dir)
++{
++	EmbedVfsDir *d = (EmbedVfsDir *) dir;
++	int			rc;
++
++	if (!vfs_is_dir(dir))
++		return closedir(dir);
++
++	rc = embed_vfs_close(d->fd);
++	free(d->batch);
++	free(d);
++	return rc;
++}
++
++int
++embed_vfs_dirfd(DIR *dir)
++{
++	EmbedVfsDir *d = (EmbedVfsDir *) dir;
++
++	if (!vfs_is_dir(dir))
++		return dirfd(dir);
++	return d->fd;
++}
++
++void
++embed_vfs_rewinddir(DIR *dir)
++{
++	EmbedVfsDir *d = (EmbedVfsDir *) dir;
++
++	if (!vfs_is_dir(dir))
++	{
++		rewinddir(dir);
++		return;
++	}
++	vfs_lookup(d->fd)->dirindex = 0;
++	d->batch_len = d->batch_pos = 0;
++	d->eof = false;
++}
++
++/* ----------------------------------------------------------------
++ * Buffered files
++ * ---------------------------------------------------------------- */
++
++/* The flags fopen(3) implies for a given mode string */
++static int
++fopen_flags(const char *mode)
++{
++	switch (mode[0])
++	{
++		case 'w':
++			return (strchr(mode, '+') ? O_RDWR : O_WRONLY) | O_CREAT | O_TRUNC;
++		case 'a':
++			return (strchr(mode, '+') ? O_RDWR : O_WRONLY) | O_CREAT | O_APPEND;
++		case 'r':
++		default:
++			return strchr(mode, '+') ? O_RDWR : O_RDONLY;
++	}
++}
++
++#ifdef __APPLE__
++static int
++cookie_read(void *cookie, char *buf, int len)
++{
++	return (int) embed_vfs_read((int) (intptr_t) cookie, buf, (size_t) len);
++}
++
++static int
++cookie_write(void *cookie, const char *buf, int len)
++{
++	return (int) embed_vfs_write((int) (intptr_t) cookie, buf, (size_t) len);
++}
++
++static fpos_t
++cookie_seek(void *cookie, fpos_t offset, int whence)
++{
++	return embed_vfs_lseek((int) (intptr_t) cookie, (off_t) offset, whence);
++}
++
++static int
++cookie_close(void *cookie)
++{
++	return embed_vfs_close((int) (intptr_t) cookie);
++}
++#else
++static ssize_t
++cookie_read(void *cookie, char *buf, size_t len)
++{
++	return embed_vfs_read((int) (intptr_t) cookie, buf, len);
++}
++
++static ssize_t
++cookie_write(void *cookie, const char *buf, size_t len)
++{
++	return embed_vfs_write((int) (intptr_t) cookie, buf, len);
++}
++
++static int
++cookie_seek(void *cookie, off64_t *offset, int whence)
++{
++	off_t		result = embed_vfs_lseek((int) (intptr_t) cookie,
++										 (off_t) *offset, whence);
++
++	if (result < 0)
++		return -1;
++	*offset = result;
++	return 0;
++}
++
++static int
++cookie_close(void *cookie)
++{
++	return embed_vfs_close((int) (intptr_t) cookie);
++}
++#endif
++
++/*
++ * The descriptor behind a FILE of ours.
++ *
++ * A stream built from callbacks has no descriptor the kernel would recognise,
++ * so fileno() reports failure for it — and callers that go on to fstat() what
++ * it returned would be asking about descriptor -1.  Ours are found here
++ * instead.
++ */
++int
++embed_vfs_fileno(FILE *stream)
++{
++	for (int i = 0; i < EMBED_VFS_MAX_FILES; i++)
++	{
++		if (vfs_files[i].inuse && vfs_files[i].stream == stream)
++			return EMBED_VFS_FD_BASE + i;
++	}
++	return fileno(stream);
++}
++
++/*
++ * stdio cannot be handed one of our descriptors — it would pass it to the
++ * kernel — so the FILE is given callbacks that come back through here.
++ */
++FILE *
++embed_vfs_fopen(const char *path, const char *mode)
++{
++	int			fd;
++	FILE	   *file;
++
++	if (vfs_channel() < 0)
++		return fopen(path, mode);
++
++	fd = embed_vfs_open(path, fopen_flags(mode), 0666);
++	if (fd < 0)
++		return NULL;
++
++	/* A real descriptor is one stdio can take as it is */
++	if (vfs_lookup(fd) == NULL)
++	{
++		file = fdopen(fd, mode);
++		if (file == NULL)
++		{
++			int			save_errno = errno;
++
++			close(fd);
++			errno = save_errno;
++		}
++		return file;
++	}
++
++#ifdef __APPLE__
++	file = funopen((void *) (intptr_t) fd,
++				   cookie_read, cookie_write, cookie_seek, cookie_close);
++#else
++	{
++		cookie_io_functions_t io = {
++			.read = cookie_read,
++			.write = cookie_write,
++			.seek = cookie_seek,
++			.close = cookie_close,
++		};
++
++		file = fopencookie((void *) (intptr_t) fd, mode, io);
++	}
++#endif
++
++	if (file == NULL)
++	{
++		int			save_errno = errno;
++
++		embed_vfs_close(fd);
++		errno = save_errno;
++		return NULL;
++	}
++
++	vfs_lookup(fd)->stream = file;
++	return file;
++}

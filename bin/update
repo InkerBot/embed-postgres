@@ -2,18 +2,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(dirname "$SCRIPT_DIR")"
-POSTGRES="$ROOT/works/postgres"
-REV_FILE="$ROOT/works/rev"
-
-# defaults
-REPO_URL="https://github.com/postgres/postgres.git"
-UPSTREAM_BRANCH="master"
-
-CONFIG="$ROOT/works/config"
-if [ -f "$CONFIG" ]; then
-    . "$CONFIG"
-fi
+. "$SCRIPT_DIR/common.sh"
 
 if [ -d "$POSTGRES/.git" ]; then
     echo "Updating postgres..."

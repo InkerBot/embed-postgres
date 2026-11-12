@@ -1,6 +1,8 @@
+diff --git a/src/interfaces/libpq/fe-connect.c b/src/interfaces/libpq/fe-connect.c
+index db9b4c8..b2e9c35 100644
 --- a/src/interfaces/libpq/fe-connect.c
 +++ b/src/interfaces/libpq/fe-connect.c
-@@ -8421,3 +8421,144 @@
+@@ -8421,3 +8421,153 @@ PQgetThreadLock(void)
  	Assert(pg_g_threadlock);
  	return pg_g_threadlock;
  }
@@ -8,12 +10,14 @@
 +/*
 + * PQconnectSocket - create a PGconn from an already-connected socket fd.
 + *
-+ * This is used by embed mode: the caller provides an fd from socketpair()
-+ * that is already connected to a PostgreSQL backend. We wrap it in a PGconn,
-+ * send the startup packet, and drive the handshake to completion.
++ * Used by embed mode: fd is one end of a socketpair whose peer is already a
++ * backend, so connection establishment is skipped and only the startup
++ * handshake is driven here.  Host and port in conninfo are irrelevant.
 + *
-+ * The conninfo string provides dbname, user, client_encoding, etc.
-+ * Host/port are irrelevant since the socket is already connected.
++ * Ownership of fd transfers to the returned PGconn, so PQfinish() closes it —
++ * including when the returned connection is CONNECTION_BAD.  The only case the
++ * caller still has to handle is a NULL return (out of memory), where the fd has
++ * already been closed here.
 + */
 +PGconn *
 +PQconnectSocket(int fd, const char *conninfo)
@@ -22,22 +26,24 @@
 +	PQconninfoOption *connOptions;
 +	PQExpBufferData errorBuf;
 +	PostgresPollingStatusType poll_status;
++	char		sebuf[PG_STRERROR_R_BUFLEN];
 +
 +	initPQExpBuffer(&errorBuf);
 +
-+	/*
-+	 * Allocate an empty PGconn struct.
-+	 */
 +	conn = pqMakeEmptyPGconn();
 +	if (conn == NULL)
 +	{
 +		termPQExpBuffer(&errorBuf);
++		close(fd);
 +		return NULL;
 +	}
 +
 +	/*
-+	 * Parse the conninfo string and fill in connection parameters.
++	 * Adopt the descriptor before anything that can fail, so that every error
++	 * path below hands back a PGconn whose PQfinish() closes it.
 +	 */
++	conn->sock = fd;
++
 +	connOptions = conninfo_parse(conninfo, &errorBuf, true);
 +	if (connOptions == NULL)
 +	{
@@ -55,63 +61,69 @@
 +	}
 +	PQconninfoFree(connOptions);
 +
-+	/*
-+	 * Compute derived connection options (this sets up things like
-+	 * client_encoding, etc.)
-+	 */
 +	if (!pqConnectOptions2(conn))
 +		return conn;
 +
-+	/*
-+	 * Install the pre-connected socket fd directly.
-+	 */
-+	conn->sock = fd;
 +	conn->options_valid = true;
 +
-+	/* Clear I/O buffers */
++	/*
++	 * Repeat the socket setup that the normal path performs after connect().
++	 * Without it the caller would get a blocking descriptor with no SIGPIPE
++	 * protection, and PQsetnonblocking()/PQconsumeInput() would not behave as
++	 * documented.  TCP-only setup (nodelay, keepalives) is skipped on purpose;
++	 * the descriptor is always a local socketpair here.
++	 */
++	if (!pg_set_noblock(conn->sock))
++	{
++		libpq_append_conn_error(conn, "could not set socket to nonblocking mode: %s",
++								SOCK_STRERROR(SOCK_ERRNO, sebuf, sizeof(sebuf)));
++		conn->status = CONNECTION_BAD;
++		return conn;
++	}
++
++#ifdef F_SETFD
++	if (fcntl(conn->sock, F_SETFD, FD_CLOEXEC) == -1)
++	{
++		libpq_append_conn_error(conn, "could not set socket to close-on-exec mode: %s",
++								SOCK_STRERROR(SOCK_ERRNO, sebuf, sizeof(sebuf)));
++		conn->status = CONNECTION_BAD;
++		return conn;
++	}
++#endif
++
++	/* Block SIGPIPE on sends; see the long comment in PQconnectPoll(). */
++	conn->sigpipe_so = false;
++#ifdef MSG_NOSIGNAL
++	conn->sigpipe_flag = true;
++#else
++	conn->sigpipe_flag = false;
++#endif
++#ifdef SO_NOSIGPIPE
++	{
++		int			optval = 1;
++
++		if (setsockopt(conn->sock, SOL_SOCKET, SO_NOSIGPIPE,
++					   (char *) &optval, sizeof(optval)) == 0)
++		{
++			conn->sigpipe_so = true;
++			conn->sigpipe_flag = false;
++		}
++	}
++#endif
++
 +	conn->inStart = conn->inCursor = conn->inEnd = 0;
 +	conn->outCount = 0;
 +
-+	/*
-+	 * Set protocol version. This is normally done during connection
-+	 * negotiation, but we skip that for socketpair connections.
-+	 */
++	/* No negotiation happens on a socketpair, so pin the version ourselves */
 +	conn->pversion = PG_PROTOCOL_LATEST;
 +
-+	/*
-+	 * Set the connection state to CONNECTION_MADE, which tells
-+	 * PQconnectPoll to send the startup packet. We skip all encryption
-+	 * negotiation since this is a local socketpair.
-+	 */
++	/* CONNECTION_MADE makes PQconnectPoll send the startup packet next */
 +	conn->status = CONNECTION_MADE;
 +	conn->current_enc_method = ENC_PLAINTEXT;
 +
-+	/*
-+	 * Set up a dummy connhost entry so libpq doesn't crash when it tries
-+	 * to access host info during the handshake.
-+	 */
-+	if (conn->connhost == NULL)
-+	{
-+		conn->nconnhost = 1;
-+		conn->whichhost = 0;
-+		conn->connhost = calloc(1, sizeof(pg_conn_host));
-+		if (conn->connhost == NULL)
-+		{
-+			libpq_append_conn_error(conn, "out of memory");
-+			conn->status = CONNECTION_BAD;
-+			return conn;
-+		}
-+		conn->connhost[0].type = CHT_UNIX_SOCKET;
-+		conn->connhost[0].host = strdup("");
-+		conn->connhost[0].hostaddr = strdup("");
-+		conn->connhost[0].port = strdup("5432");
-+	}
++	/* Starting at CONNECTION_MADE skips the state that normally picks a host */
++	conn->whichhost = 0;
 +
-+	/*
-+	 * Drive PQconnectPoll to send startup packet and complete handshake.
-+	 * This handles: StartupMessage -> AuthRequest -> ParameterStatus ->
-+	 * BackendKeyData -> ReadyForQuery.
-+	 */
 +	for (;;)
 +	{
 +		poll_status = PQconnectPoll(conn);
@@ -120,7 +132,6 @@
 +		if (poll_status == PGRES_POLLING_FAILED)
 +			break;
 +
-+		/* Wait for the socket to be ready */
 +		if (poll_status == PGRES_POLLING_READING)
 +		{
 +			if (PQsocketPoll(conn->sock, 1, 0, -1) < 0)

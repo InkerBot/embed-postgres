@@ -1,11 +1,29 @@
+diff --git a/src/include/postmaster/postmaster.h b/src/include/postmaster/postmaster.h
+index 716b4c9..9b011ea 100644
 --- a/src/include/postmaster/postmaster.h
 +++ b/src/include/postmaster/postmaster.h
-@@ -142,4 +142,8 @@
+@@ -142,4 +142,24 @@ typedef enum DispatchOption
  
  extern DispatchOption parse_dispatch_option(const char *name);
  
-+/* Embed mode API */
-+extern void embed_set_postmaster_mode(bool mode);
-+extern void embed_set_control_fd(int fd);
++/*
++ * Embed mode control channel: single-byte messages over a socketpair whose
++ * descriptor number the host passes in EMBED_CONTROL_FD.  It carries
++ * everything the two sides need from each other, so neither has to signal or
++ * wait on the other.
++ *
++ * EMBED_MSG_READY is asynchronous and may repeat (PM_HOT_STANDBY, then
++ * PM_RUN), so the host must dispatch on the message byte; every
++ * EMBED_CMD_CONNECT is answered with exactly one ACK or ERROR, and
++ * EMBED_CMD_SHUTDOWN is not answered at all.  EMBED_MSG_EXITING is the only
++ * message with a payload: one byte holding the exit status.  Mirrored in the
++ * embed library's src/embed_internal.h — keep both in sync.
++ */
++#define EMBED_CMD_CONNECT	'C'		/* host -> pm, carries an fd via SCM_RIGHTS */
++#define EMBED_CMD_SHUTDOWN	'S'		/* host -> pm, no fd */
++#define EMBED_MSG_READY		'R'		/* pm -> host, async, may repeat */
++#define EMBED_MSG_ACK		'A'		/* pm -> host, backend started */
++#define EMBED_MSG_ERROR		'E'		/* pm -> host, backend not started */
++#define EMBED_MSG_EXITING	'X'		/* pm -> host, followed by the exit status */
 +
  #endif							/* _POSTMASTER_H */

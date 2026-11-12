@@ -18,14 +18,7 @@ TEST(InitdbTest, CreatesExpectedFiles) {
     TempDataDir dir;
     ASSERT_FALSE(dir.path().empty());
 
-    const char *share = get_pg_share_dir();
-    ASSERT_NE(share, nullptr);
-
-    embed_pg_options opts = {};
-    opts.data_dir = dir.path().c_str();
-    opts.pg_data_path = share;
-    opts.superuser = "postgres";
-    opts.encoding = "UTF8";
+    embed_pg_options opts = dir.options();
 
     ASSERT_EQ(embed_pg_initdb(&opts), 0);
 
@@ -55,20 +48,13 @@ TEST(InitdbTest, AppendsConfig) {
     TempDataDir dir;
     ASSERT_FALSE(dir.path().empty());
 
-    const char *share = get_pg_share_dir();
-    ASSERT_NE(share, nullptr);
-
-    embed_pg_options opts = {};
-    opts.data_dir = dir.path().c_str();
-    opts.pg_data_path = share;
-    opts.superuser = "postgres";
-    opts.encoding = "UTF8";
+    embed_pg_options opts = dir.options();
 
     ASSERT_EQ(embed_pg_initdb(&opts), 0);
 
     std::string conf = read_file(dir.path() + "/postgresql.conf");
     EXPECT_FALSE(conf.empty());
-    // embed_pg_initdb appends "fsync = off"
+    // embed_pg_initdb() appends "fsync = off"
     EXPECT_NE(conf.find("fsync = off"), std::string::npos);
 }
 
@@ -76,14 +62,7 @@ TEST(InitdbTest, FullLifecycleAfterInit) {
     TempDataDir dir;
     ASSERT_FALSE(dir.path().empty());
 
-    const char *share = get_pg_share_dir();
-    ASSERT_NE(share, nullptr);
-
-    embed_pg_options opts = {};
-    opts.data_dir = dir.path().c_str();
-    opts.pg_data_path = share;
-    opts.superuser = "postgres";
-    opts.encoding = "UTF8";
+    embed_pg_options opts = dir.options();
 
     ASSERT_EQ(embed_pg_initdb(&opts), 0);
 

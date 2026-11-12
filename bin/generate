@@ -2,10 +2,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(dirname "$SCRIPT_DIR")"
-POSTGRES="$ROOT/works/postgres"
-PATCH_DIR="$ROOT/works/patch"
-CORE="$ROOT/works/core"
+. "$SCRIPT_DIR/common.sh"
 
 if [ ! -d "$POSTGRES/.git" ]; then
     echo "Error: works/postgres not found. Run update first." >&2
@@ -13,11 +10,20 @@ if [ ! -d "$POSTGRES/.git" ]; then
 fi
 
 if [ ! -d "$CORE" ]; then
-    echo "Error: works/core not found. Run generate first." >&2
+    echo "Error: works/core not found. Run apply first." >&2
     exit 1
 fi
 
-IGNORE_FILE="$ROOT/works/ignore"
+if [ -f "$REV_FILE" ]; then
+    stored_rev="$(tr -d '[:space:]' < "$REV_FILE")"
+    current_rev="$(git -C "$POSTGRES" rev-parse HEAD)"
+    if [ "$stored_rev" != "$current_rev" ]; then
+        echo "Warning: works/postgres is at $current_rev" >&2
+        echo "         but works/rev records   $stored_rev" >&2
+        echo "         Patches would capture unrelated upstream changes." >&2
+        echo "         Run 'bin/apply' to rebuild works/core at the stored rev." >&2
+    fi
+fi
 
 is_ignored() {
     [ -f "$IGNORE_FILE" ] || return 1
@@ -40,6 +46,24 @@ is_ignored() {
     return 1
 }
 
+emit_patch() {
+    _src="$1"
+    _dst="$2"
+    _rel="$3"
+    _out="$4"
+
+    mkdir -p "$(dirname "$_out")"
+    git diff --no-index --no-color --binary "$_src" "$_dst" | awk -v rel="$_rel" '
+        !hunk {
+            if (/^diff --git /) { print "diff --git a/" rel " b/" rel; next }
+            if (/^--- /) { print ($0 == "--- /dev/null") ? $0 : "--- a/" rel; next }
+            if (/^\+\+\+ /) { print ($0 == "+++ /dev/null") ? $0 : "+++ b/" rel; next }
+            if (/^@@/) { hunk = 1 }
+        }
+        { print }
+    ' > "$_out"
+}
+
 echo "Clearing existing patches..."
 rm -rf "$PATCH_DIR"
 mkdir -p "$PATCH_DIR"
@@ -52,14 +76,12 @@ find "$CORE" -not -path "$CORE/.git/*" -type f | sort | while read -r dst_file; 
     patch_file="$PATCH_DIR/$rel.patch"
 
     if [ -f "$src_file" ]; then
-        if ! diff -q "$src_file" "$dst_file" > /dev/null 2>&1; then
-            mkdir -p "$(dirname "$patch_file")"
-            diff -u --label "a/$rel" --label "b/$rel" "$src_file" "$dst_file" > "$patch_file" || true
+        if ! cmp -s "$src_file" "$dst_file"; then
+            emit_patch "$src_file" "$dst_file" "$rel" "$patch_file"
             echo "  Modified: $rel"
         fi
     else
-        mkdir -p "$(dirname "$patch_file")"
-        diff -u --label /dev/null --label "b/$rel" /dev/null "$dst_file" > "$patch_file" || true
+        emit_patch /dev/null "$dst_file" "$rel" "$patch_file"
         echo "  New: $rel"
     fi
 done
@@ -72,8 +94,7 @@ find "$POSTGRES" -not -path "$POSTGRES/.git/*" -type f | sort | while read -r sr
     patch_file="$PATCH_DIR/$rel.patch"
 
     if [ ! -f "$dst_file" ]; then
-        mkdir -p "$(dirname "$patch_file")"
-        diff -u --label "a/$rel" --label /dev/null "$src_file" /dev/null > "$patch_file" || true
+        emit_patch "$src_file" /dev/null "$rel" "$patch_file"
         echo "  Deleted: $rel"
     fi
 done

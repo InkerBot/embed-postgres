@@ -3,11 +3,14 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
+#include <ctime>
 #include <ftw.h>
+#include <poll.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-// ---- TempDataDir ----
 
 TempDataDir::TempDataDir() {
     char tmpl[] = "/tmp/embed_pg_test_XXXXXX";
@@ -25,28 +28,56 @@ static int remove_cb(const char *fpath, const struct stat * /*sb*/,
     return remove(fpath);
 }
 
+/*
+ * Only a postmaster that died abruptly — as the kill tests make it — leaves its
+ * System V segment behind, and nothing will look at this data directory again,
+ * so the segment would leak until reboot.  macOS allows only kern.sysv.shmmni
+ * (32) of them system-wide: leak enough and every later initdb fails with
+ * "could not create shared memory segment: No space left on device".
+ *
+ * Line 7 of the lock file holds "<key> <id>" (LOCK_FILE_LINE_SHMEM_KEY).
+ */
+static void release_orphan_shmem(const std::string &data_dir) {
+    std::string pidfile = data_dir + "/postmaster.pid";
+    FILE *f = fopen(pidfile.c_str(), "r");
+    if (!f) return;
+
+    char line[256];
+    unsigned long key = 0, id = 0;
+    for (int lineno = 1; lineno <= 7; lineno++) {
+        if (!fgets(line, sizeof(line), f)) break;
+        if (lineno == 7) sscanf(line, "%lu %lu", &key, &id);
+    }
+    fclose(f);
+
+    // shmid 0 is a valid id, so key is the "we found a line" signal.
+    if (key != 0) shmctl(static_cast<int>(id), IPC_RMID, nullptr);
+}
+
+embed_pg_options TempDataDir::options() const {
+    embed_pg_options opts = {};
+    opts.data_dir = path_.c_str();
+    opts.pg_data_path = get_pg_share_dir();
+    opts.superuser = "postgres";
+    opts.encoding = "UTF8";
+    return opts;
+}
+
 TempDataDir::~TempDataDir() {
     if (!path_.empty()) {
+        release_orphan_shmem(path_);
         nftw(path_.c_str(), remove_cb, 64, FTW_DEPTH | FTW_PHYS);
     }
 }
 
-// ---- TestServer ----
-
 TestServer::TestServer() {
     if (dir_.path().empty()) return;
 
-    const char *share = get_pg_share_dir();
-    if (!share) {
+    embed_pg_options opts = dir_.options();
+    if (!opts.pg_data_path) {
         fprintf(stderr, "TestServer: PG_SHARE_DIR not set\n");
         return;
     }
-
-    embed_pg_options opts = {};
-    opts.data_dir = dir_.path().c_str();
-    opts.pg_data_path = share;
-    opts.superuser = "postgres";
-    opts.encoding = "UTF8";
 
     if (embed_pg_initdb(&opts) != 0) {
         fprintf(stderr, "TestServer: embed_pg_initdb failed\n");
@@ -84,8 +115,6 @@ TestServer::~TestServer() {
     }
 }
 
-// ---- TestConnection ----
-
 TestConnection::TestConnection(embed_pg_server *srv,
                                const char *dbname,
                                const char *username)
@@ -103,7 +132,40 @@ PGresult *TestConnection::exec(const char *sql) {
     return PQexec(conn_, sql);
 }
 
-// ---- Utility ----
+PGnotify *wait_for_notify(PGconn *conn, int timeout_ms) {
+    if (!conn) return nullptr;
+
+    // A notification may already be buffered from an earlier read.
+    if (PGnotify *n = PQnotifies(conn)) return n;
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += static_cast<long>(timeout_ms % 1000) * 1000000;
+    if (deadline.tv_nsec >= 1000000000) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000;
+    }
+
+    for (;;) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long remaining = (deadline.tv_sec - now.tv_sec) * 1000
+                       + (deadline.tv_nsec - now.tv_nsec) / 1000000;
+        if (remaining <= 0) return nullptr;
+
+        struct pollfd pfd = {PQsocket(conn), POLLIN, 0};
+        int rc = poll(&pfd, 1, static_cast<int>(remaining));
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            return nullptr;
+        }
+        if (rc == 0) return nullptr;
+
+        if (!PQconsumeInput(conn)) return nullptr;
+        if (PGnotify *n = PQnotifies(conn)) return n;
+    }
+}
 
 const char *get_pg_share_dir() {
     const char *env = getenv("PG_SHARE_DIR");
@@ -114,51 +176,6 @@ const char *get_pg_share_dir() {
     return nullptr;
 #endif
 }
-
-const char *get_pg_bin_dir() {
-    const char *env = getenv("PG_BIN_DIR");
-    if (env) return env;
-#ifdef TEST_PG_BIN_DIR
-    return TEST_PG_BIN_DIR;
-#else
-    return nullptr;
-#endif
-}
-
-int run_external_initdb(const char *data_dir, const char *share_dir) {
-    const char *bin_dir = get_pg_bin_dir();
-    if (!bin_dir) return -1;
-
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd),
-             "%s/initdb -D '%s' -L '%s' --no-locale -U postgres -E UTF8 "
-             "-A trust -N --no-instructions >/dev/null 2>&1",
-             bin_dir, data_dir, share_dir);
-    int rc = system(cmd);
-    if (rc != 0) {
-        fprintf(stderr, "run_external_initdb: command failed (rc=%d)\n", rc);
-        return -1;
-    }
-
-    // Append embedded-mode optimizations to postgresql.conf
-    char conf_path[1024];
-    snprintf(conf_path, sizeof(conf_path), "%s/postgresql.conf", data_dir);
-    FILE *f = fopen(conf_path, "a");
-    if (f) {
-        fprintf(f,
-            "\n# Embedded PostgreSQL test optimizations\n"
-            "max_wal_senders = 0\n"
-            "wal_level = minimal\n"
-            "fsync = off\n"
-            "synchronous_commit = off\n"
-            "full_page_writes = off\n"
-        );
-        fclose(f);
-    }
-    return 0;
-}
-
-// ---- EmbedPgTest fixture ----
 
 TestServer *EmbedPgTest::server_ = nullptr;
 

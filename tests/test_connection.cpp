@@ -40,7 +40,6 @@ TEST_F(ConnectionTest, TwoConcurrentConnections) {
     ASSERT_TRUE(conn2.is_ok());
     EXPECT_NE(PQbackendPID(conn1.get()), PQbackendPID(conn2.get()));
 
-    // Both should work independently
     PGresult *res1 = conn1.exec("SELECT 1");
     PGresult *res2 = conn2.exec("SELECT 2");
     ASSERT_EQ(PQresultStatus(res1), PGRES_TUPLES_OK);

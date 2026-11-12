@@ -1,3 +1,5 @@
+diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
+index 3fac46c..c519202 100644
 --- a/src/backend/postmaster/postmaster.c
 +++ b/src/backend/postmaster/postmaster.c
 @@ -72,6 +72,7 @@
@@ -8,21 +10,32 @@
  #include <fcntl.h>
  #include <sys/param.h>
  #include <netdb.h>
-@@ -398,6 +399,13 @@
+@@ -398,6 +399,15 @@ static volatile sig_atomic_t pending_pm_immediate_shutdown_request;
  /* event multiplexing object */
  static WaitEventSet *pm_wait_set;
  
-+/* Embed mode state */
 +static bool embed_mode = false;
 +static int embed_control_fd = -1;
 +
-+static int embed_recv_fd(int socket, char *cmd);
++static void embed_init_control_fd(void);
++static int embed_recv_fd(int socket, char *cmd, int *fd);
 +static void embed_handle_control_event(void);
++static void embed_notify_ready(void);
++static void embed_notify_exit(int status);
 +
  #ifdef USE_SSL
  /* Set when and if SSL has been initialized properly */
  bool		LoadedSSL = false;
-@@ -1271,7 +1279,7 @@
+@@ -504,6 +514,8 @@ PostmasterMain(int argc, char *argv[])
+ 
+ 	IsPostmasterEnvironment = true;
+ 
++	embed_init_control_fd();
++
+ 	/*
+ 	 * Start our win32 signal implementation
+ 	 */
+@@ -1271,7 +1283,7 @@ PostmasterMain(int argc, char *argv[])
  	/*
  	 * check that we have some socket to listen on
  	 */
@@ -31,7 +44,7 @@
  		ereport(FATAL,
  				(errmsg("no socket created for listening")));
  
-@@ -1639,12 +1647,17 @@
+@@ -1639,12 +1651,17 @@ DetermineSleepTime(void)
  static void
  ConfigurePostmasterWaitSet(bool accept_connections)
  {
@@ -51,19 +64,18 @@
  	AddWaitEventToSet(pm_wait_set, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch,
  					  NULL);
  
-@@ -1654,6 +1667,11 @@
+@@ -1654,6 +1671,10 @@ ConfigurePostmasterWaitSet(bool accept_connections)
  			AddWaitEventToSet(pm_wait_set, WL_SOCKET_ACCEPT, ListenSockets[i],
  							  NULL, NULL);
  	}
 +
-+	/* Always monitor the embed control fd (for both connections and shutdown) */
 +	if (embed_mode && embed_control_fd >= 0)
 +		AddWaitEventToSet(pm_wait_set, WL_SOCKET_READABLE, embed_control_fd,
 +						  NULL, NULL);
  }
  
  /*
-@@ -1664,7 +1682,7 @@
+@@ -1664,7 +1685,7 @@ ServerLoop(void)
  {
  	time_t		last_lockfile_recheck_time,
  				last_touch_time;
@@ -72,7 +84,7 @@
  	int			nevents;
  
  	ConfigurePostmasterWaitSet(true);
-@@ -1705,18 +1723,26 @@
+@@ -1705,18 +1726,23 @@ ServerLoop(void)
  			if (pending_pm_pmsignal)
  				process_pm_pmsignal();
  
@@ -81,10 +93,7 @@
  			{
 -				ClientSocket s;
 +				if (embed_mode && events[i].fd == embed_control_fd)
-+				{
-+					/* Embed control fd: handle connection or shutdown */
 +					embed_handle_control_event();
-+				}
 +				else if (events[i].events & WL_SOCKET_ACCEPT)
 +				{
 +					ClientSocket s;
@@ -108,11 +117,10 @@
  				}
  			}
  		}
-@@ -1909,6 +1935,13 @@
+@@ -1909,6 +1935,12 @@ ClosePostmasterPorts(bool am_syslogger)
  	ListenSockets = NULL;
  #endif
  
-+	/* Close the embed control fd in child processes */
 +	if (embed_mode && embed_control_fd >= 0)
 +	{
 +		close(embed_control_fd);
@@ -122,52 +130,80 @@
  	/*
  	 * If using syslogger, close the read side of the pipe.  We don't bother
  	 * tracking this in fd.c, either.
-@@ -2362,6 +2395,13 @@
- #ifdef USE_SYSTEMD
+@@ -2363,6 +2395,8 @@ process_pm_child_exit(void)
  			sd_notify(0, "READY=1");
  #endif
-+
-+			/* Notify embed parent that server is ready */
-+			if (embed_mode && embed_control_fd >= 0)
-+			{
-+				char ready_byte = 'R';
-+				send(embed_control_fd, &ready_byte, 1, 0);
-+			}
  
++			embed_notify_ready();
++
  			continue;
  		}
-@@ -3769,6 +3809,13 @@
+ 
+@@ -3696,6 +3730,8 @@ ExitPostmaster(int status)
+ 	 * MUST		-- vadim 05-10-1999
+ 	 */
+ 
++	embed_notify_exit(status);
++
+ 	proc_exit(status);
+ }
+ 
+@@ -3769,6 +3805,8 @@ process_pm_pmsignal(void)
  		sd_notify(0, "READY=1");
  #endif
  
-+		/* Notify embed parent that server is ready */
-+		if (embed_mode && embed_control_fd >= 0)
-+		{
-+			char ready_byte = 'R';
-+			send(embed_control_fd, &ready_byte, 1, 0);
-+		}
++		embed_notify_ready();
 +
  		UpdatePMState(PM_HOT_STANDBY);
  		connsAllowed = true;
  
-@@ -4641,3 +4688,93 @@
+@@ -4641,3 +4679,183 @@ InitPostmasterDeathWatchHandle(void)
  								 GetLastError())));
  #endif							/* WIN32 */
  }
 +
 +/*
-+ * Receive a file descriptor via SCM_RIGHTS on the embed control socket.
-+ * Sets *cmd to the command byte ('C' for connect, 'S' for shutdown).
-+ * Returns the received fd, or -1 on error/disconnect.
++ * Enter embed mode when the host handed us a control socket.
++ *
++ * The descriptor is inherited across the exec that started us and named in the
++ * environment, so the host needs neither a symbol lookup nor a signal to set
++ * this up — it can bring the postmaster into being with a plain posix_spawn().
++ */
++static void
++embed_init_control_fd(void)
++{
++	const char *value = getenv("EMBED_CONTROL_FD");
++	char	   *endptr;
++	long		fd;
++
++	if (value == NULL || *value == '\0')
++		return;
++
++	errno = 0;
++	fd = strtol(value, &endptr, 10);
++	if (errno != 0 || *endptr != '\0' || fd < 0 || fd > INT_MAX)
++		ereport(FATAL,
++				(errmsg("invalid value for EMBED_CONTROL_FD: \"%s\"", value)));
++
++	embed_control_fd = (int) fd;
++	embed_mode = true;
++}
++
++/*
++ * Receive one command byte from the embed control socket, plus the descriptor
++ * it carries, if any.  Returns 0 on success, -1 on error or peer disconnect.
 + */
 +static int
-+embed_recv_fd(int socket, char *cmd)
++embed_recv_fd(int socket, char *cmd, int *fd)
 +{
 +	char cmsgbuf[CMSG_SPACE(sizeof(int))];
 +	struct cmsghdr *cmsg;
 +	struct iovec iov;
 +	struct msghdr msg;
-+	int fd;
++	ssize_t n;
++
++	*cmd = 0;
++	*fd = -1;
 +
 +	iov.iov_base = cmd;
 +	iov.iov_len = 1;
@@ -179,68 +215,129 @@
 +	msg.msg_control = cmsgbuf;
 +	msg.msg_controllen = sizeof(cmsgbuf);
 +
-+	if (recvmsg(socket, &msg, 0) <= 0)
++	do
++	{
++		n = recvmsg(socket, &msg, 0);
++	} while (n < 0 && errno == EINTR);
++
++	if (n <= 0)
 +		return -1;
 +
-+	cmsg = CMSG_FIRSTHDR(&msg);
-+	if (!cmsg)
-+		return -1;
++	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
++		 cmsg = CMSG_NXTHDR(&msg, cmsg))
++	{
++		if (cmsg->cmsg_level == SOL_SOCKET &&
++			cmsg->cmsg_type == SCM_RIGHTS &&
++			cmsg->cmsg_len == CMSG_LEN(sizeof(int)))
++		{
++			memcpy(fd, CMSG_DATA(cmsg), sizeof(int));
++			break;
++		}
++	}
 +
-+	memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
-+	return fd;
++	/* A truncated control message may have dropped descriptors on the floor */
++	if (msg.msg_flags & MSG_CTRUNC)
++	{
++		if (*fd >= 0)
++			close(*fd);
++		*fd = -1;
++		return -1;
++	}
++
++	return 0;
 +}
 +
 +/*
-+ * Handle an event on the embed control fd.
-+ * Called from ServerLoop when the control fd is readable.
++ * Tell the embed host that we are accepting connections.  Sent from both
++ * PM_RUN and the PM_STARTUP -> PM_HOT_STANDBY transition, so the host may see
++ * it more than once and must treat it as an asynchronous notice.  Send errors
++ * are ignored: a host that is gone also closes the control channel, which
++ * ServerLoop already turns into a shutdown.
++ */
++static void
++embed_notify_ready(void)
++{
++	char		ready_byte = EMBED_MSG_READY;
++
++	if (embed_mode && embed_control_fd >= 0)
++		send(embed_control_fd, &ready_byte, 1, 0);
++}
++
++/*
++ * Report the exit status to the embed host on the way out.
++ *
++ * This is what frees the host from waiting on us: it learns the status from
++ * the control channel instead of from waitpid(), so it never has to compete
++ * with whatever SIGCHLD handling its own runtime installs.  A host that died
++ * first leaves no reader, hence the ignored send() error.
++ */
++static void
++embed_notify_exit(int status)
++{
++	char		msg[2];
++
++	if (!embed_mode || embed_control_fd < 0)
++		return;
++
++	msg[0] = EMBED_MSG_EXITING;
++	msg[1] = (char) (unsigned char) status;
++	send(embed_control_fd, msg, sizeof(msg), 0);
++}
++
++/*
++ * Handle a readable embed control fd.  Every EMBED_CMD_CONNECT is answered
++ * with exactly one reply byte, so the host never hands out a PGconn for a
++ * backend that was not started.
 + */
 +static void
 +embed_handle_control_event(void)
 +{
 +	char cmd = 0;
-+	int fd = embed_recv_fd(embed_control_fd, &cmd);
++	int fd = -1;
++	char reply;
++	ClientSocket cs;
 +
-+	if (fd < 0 || cmd == 'S')
++	if (embed_recv_fd(embed_control_fd, &cmd, &fd) < 0 ||
++		cmd == EMBED_CMD_SHUTDOWN)
 +	{
-+		/* Shutdown request or control fd closed */
++		/* Shutdown request, or the control channel went away */
++		if (fd >= 0)
++			close(fd);
 +		pending_pm_fast_shutdown_request = true;
 +		pending_pm_shutdown_request = true;
 +		SetLatch(MyLatch);
 +		return;
 +	}
 +
-+	if (cmd == 'C')
++	if (cmd != EMBED_CMD_CONNECT)
 +	{
-+		ClientSocket cs;
-+		char ack = 'A';
-+
-+		/* Connection request: create ClientSocket and start a backend */
-+		cs.sock = fd;
-+		memset(&cs.raddr, 0, sizeof(cs.raddr));
-+		cs.raddr.addr.ss_family = AF_UNIX;
-+		cs.raddr.salen = sizeof(struct sockaddr_un);
-+		BackendStartup(&cs);
-+
-+		/* Close the fd — BackendStartup has forked and the child has its copy */
-+		close(fd);
-+
-+		/* Send ACK to parent */
-+		send(embed_control_fd, &ack, 1, 0);
++		if (fd >= 0)
++			close(fd);
++		return;
 +	}
-+}
 +
-+/*
-+ * Embed mode API functions
-+ */
-+void
-+embed_set_postmaster_mode(bool mode)
-+{
-+	embed_mode = mode;
-+}
++	if (fd < 0)
++	{
++		reply = EMBED_MSG_ERROR;
++		send(embed_control_fd, &reply, 1, 0);
++		return;
++	}
 +
-+void
-+embed_set_control_fd(int fd)
-+{
-+	embed_control_fd = fd;
++	/*
++	 * Reporting the peer as AF_UNIX is what makes embed connections match the
++	 * "local" lines of pg_hba.conf rather than any host rule.
++	 */
++	cs.sock = fd;
++	memset(&cs.raddr, 0, sizeof(cs.raddr));
++	cs.raddr.addr.ss_family = AF_UNIX;
++	cs.raddr.salen = sizeof(struct sockaddr_un);
++
++	reply = (BackendStartup(&cs) == STATUS_OK)
++		? EMBED_MSG_ACK : EMBED_MSG_ERROR;
++
++	/* BackendStartup has forked; the child holds its own copy */
++	close(fd);
++
++	send(embed_control_fd, &reply, 1, 0);
 +}
 +

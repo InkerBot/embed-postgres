@@ -1,137 +1,207 @@
-/*
- * embed_loader.c
- *    In-memory decompression and loading of the embedded PostgreSQL shared library.
- *
- * The compressed shared library is embedded in the binary's data section via
- * .incbin. This module decompresses it and loads it via dlopen:
- *   - Linux: memfd_create (100% in-memory, no disk I/O)
- *   - macOS: tmpfile + dlopen + unlink (tmpfile exists briefly)
- */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 
-#include <dlfcn.h>
+#include "embed_postgres.h"
+#include "embed_internal.h"
+
 #include <zstd.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-#ifdef __linux__
-#include <sys/mman.h>
-#endif
+/* Emitted by embed_blob.S: the zstd-compressed programs */
+extern const unsigned char embed_postgres_blob_start[];
+extern const unsigned char embed_postgres_blob_end[];
+extern const unsigned char embed_initdb_blob_start[];
+extern const unsigned char embed_initdb_blob_end[];
 
-/* Symbols defined by embed_blob.S */
-extern const unsigned char embed_pg_blob_start[];
-extern const unsigned char embed_pg_blob_end[];
-
-/*
- * Decompress the embedded zstd blob and load it as a shared library.
- * Called in child process after fork().
- * Returns dlopen handle, or NULL on failure.
- */
-void *
-embed_load_pg_library(void)
+static int
+write_all(int fd, const void *buf, size_t len)
 {
-    const size_t compressed_size = (size_t)(embed_pg_blob_end - embed_pg_blob_start);
+    size_t written = 0;
 
-    /* Get decompressed size from zstd frame header */
-    unsigned long long decompressed_size =
-        ZSTD_getFrameContentSize(embed_pg_blob_start, compressed_size);
+    while (written < len) {
+        ssize_t n = write(fd, (const char *)buf + written, len - written);
+        if (n <= 0)
+            return -1;
+        written += (size_t)n;
+    }
+    return 0;
+}
 
-    if (decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN ||
-        decompressed_size == ZSTD_CONTENTSIZE_ERROR) {
+/* Decompress one embedded program into `path`, executable by us alone. */
+static int
+extract_program(const unsigned char *start, const unsigned char *end,
+                const char *path)
+{
+    const size_t compressed_size = (size_t)(end - start);
+    unsigned long long size = ZSTD_getFrameContentSize(start, compressed_size);
+    void *buf;
+    size_t result;
+    int fd;
+
+    if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR) {
         fprintf(stderr, "embed_loader: invalid zstd frame header\n");
-        return NULL;
+        return -1;
     }
 
-    /* Decompress */
-    void *buf = malloc((size_t)decompressed_size);
+    buf = malloc((size_t)size);
     if (!buf) {
-        fprintf(stderr, "embed_loader: malloc failed (%llu bytes)\n",
-                decompressed_size);
-        return NULL;
+        fprintf(stderr, "embed_loader: malloc failed (%llu bytes)\n", size);
+        return -1;
     }
 
-    size_t result = ZSTD_decompress(buf, (size_t)decompressed_size,
-                                     embed_pg_blob_start, compressed_size);
+    result = ZSTD_decompress(buf, (size_t)size, start, compressed_size);
     if (ZSTD_isError(result)) {
         fprintf(stderr, "embed_loader: zstd decompress failed: %s\n",
                 ZSTD_getErrorName(result));
         free(buf);
-        return NULL;
+        return -1;
     }
 
-    void *handle = NULL;
-    int fd;
-    size_t written;
-
-#ifdef __linux__
-    /* Linux: memfd_create — purely in-memory, no disk I/O */
-    fd = memfd_create("libpg_server", MFD_CLOEXEC);
+    fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0700);
     if (fd < 0) {
-        fprintf(stderr, "embed_loader: memfd_create failed\n");
+        fprintf(stderr, "embed_loader: cannot create %s: %s\n",
+                path, strerror(errno));
         free(buf);
-        return NULL;
+        return -1;
     }
 
-    written = 0;
-    while (written < (size_t)decompressed_size) {
-        ssize_t n = write(fd, (char *)buf + written,
-                          (size_t)decompressed_size - written);
-        if (n <= 0) {
-            fprintf(stderr, "embed_loader: write to memfd failed\n");
-            close(fd);
-            free(buf);
-            return NULL;
-        }
-        written += (size_t)n;
-    }
-
-    char fdpath[64];
-    snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", fd);
-    handle = dlopen(fdpath, RTLD_NOW | RTLD_GLOBAL);
-    if (!handle)
-        fprintf(stderr, "embed_loader: dlopen failed: %s\n", dlerror());
-    close(fd);
-#else
-    /* macOS: tmpfile, write, dlopen, immediately unlink */
-    {
-        const char *tmpdir = getenv("TMPDIR");
-        if (!tmpdir) tmpdir = "/tmp";
-        char tmppath[PATH_MAX];
-        snprintf(tmppath, sizeof(tmppath), "%s/libpg_XXXXXX.dylib", tmpdir);
-        fd = mkstemps(tmppath, 6);  /* .dylib suffix required for dlopen */
-        if (fd < 0) {
-            fprintf(stderr, "embed_loader: mkstemps failed\n");
-            free(buf);
-            return NULL;
-        }
-
-        written = 0;
-        while (written < (size_t)decompressed_size) {
-            ssize_t n = write(fd, (char *)buf + written,
-                              (size_t)decompressed_size - written);
-            if (n <= 0) {
-                fprintf(stderr, "embed_loader: write to tmpfile failed\n");
-                close(fd);
-                unlink(tmppath);
-                free(buf);
-                return NULL;
-            }
-            written += (size_t)n;
-        }
-
+    if (write_all(fd, buf, (size_t)size) < 0) {
+        fprintf(stderr, "embed_loader: writing %s failed: %s\n",
+                path, strerror(errno));
         close(fd);
-        handle = dlopen(tmppath, RTLD_NOW | RTLD_GLOBAL);
-        if (!handle)
-            fprintf(stderr, "embed_loader: dlopen failed: %s\n", dlerror());
-        unlink(tmppath);  /* Delete immediately — mapping persists in memory */
+        unlink(path);
+        free(buf);
+        return -1;
     }
-#endif
 
     free(buf);
-    return handle;
+
+    /*
+     * Close before anyone execs it: a descriptor still open for writing makes
+     * execve() fail with ETXTBSY.
+     */
+    if (close(fd) < 0) {
+        fprintf(stderr, "embed_loader: closing %s failed: %s\n",
+                path, strerror(errno));
+        unlink(path);
+        return -1;
+    }
+    return 0;
+}
+
+static int
+link_or_fail(const char *target, const char *linkpath)
+{
+    if (symlink(target, linkpath) < 0) {
+        fprintf(stderr, "embed_loader: cannot link %s -> %s: %s\n",
+                linkpath, target, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Materialise the embedded programs as a miniature PostgreSQL installation.
+ *
+ * PostgreSQL derives share and library paths from the location of its own
+ * executable, so the programs cannot simply be dropped in a scratch directory:
+ * they have to sit in a tree that looks like an install prefix.  bin/ holds the
+ * real files, while lib/ and share/ are symlinks into the installation the
+ * caller pointed us at.
+ *
+ *     <dir>/bin/postgres   <dir>/bin/initdb   <dir>/lib -> ...   <dir>/share -> ...
+ *
+ * Returns 0 on success, with the prefix written to `prefix_out` (PATH_MAX).
+ */
+int
+embed_extract_runtime(const char *share_dir, char *prefix_out)
+{
+    const char *tmpdir = getenv("TMPDIR");
+    char prefix[PATH_MAX];
+    char path[PATH_MAX];
+    char real_share[PATH_MAX];
+    char real_lib[PATH_MAX];
+    char *sep;
+
+    if (!share_dir || !prefix_out)
+        return -1;
+
+    if (!tmpdir || !*tmpdir)
+        tmpdir = "/tmp";
+
+    snprintf(prefix, sizeof(prefix), "%s/embed-pg-XXXXXX", tmpdir);
+    if (mkdtemp(prefix) == NULL) {
+        fprintf(stderr, "embed_loader: mkdtemp failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    snprintf(path, sizeof(path), "%s/bin", prefix);
+    if (mkdir(path, 0700) < 0) {
+        fprintf(stderr, "embed_loader: mkdir %s failed: %s\n",
+                path, strerror(errno));
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/bin/postgres", prefix);
+    if (extract_program(embed_postgres_blob_start, embed_postgres_blob_end,
+                        path) < 0)
+        goto fail;
+
+    snprintf(path, sizeof(path), "%s/bin/initdb", prefix);
+    if (extract_program(embed_initdb_blob_start, embed_initdb_blob_end,
+                        path) < 0)
+        goto fail;
+
+    if (realpath(share_dir, real_share) == NULL)
+        snprintf(real_share, sizeof(real_share), "%s", share_dir);
+
+    snprintf(real_lib, sizeof(real_lib), "%s", real_share);
+    sep = strrchr(real_lib, '/');
+    if (sep && sep != real_lib)
+        *sep = '\0';
+    strncat(real_lib, "/lib", sizeof(real_lib) - strlen(real_lib) - 1);
+
+    snprintf(path, sizeof(path), "%s/share", prefix);
+    if (link_or_fail(real_share, path) < 0)
+        goto fail;
+
+    snprintf(path, sizeof(path), "%s/lib", prefix);
+    if (link_or_fail(real_lib, path) < 0)
+        goto fail;
+
+    snprintf(prefix_out, PATH_MAX, "%s", prefix);
+    return 0;
+
+fail:
+    embed_remove_runtime(prefix);
+    return -1;
+}
+
+void
+embed_remove_runtime(const char *prefix)
+{
+    char path[PATH_MAX];
+
+    if (!prefix || !*prefix)
+        return;
+
+    snprintf(path, sizeof(path), "%s/bin/postgres", prefix);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/bin/initdb", prefix);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/bin", prefix);
+    rmdir(path);
+    snprintf(path, sizeof(path), "%s/share", prefix);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/lib", prefix);
+    unlink(path);
+    rmdir(prefix);
 }

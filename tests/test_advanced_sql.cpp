@@ -1,9 +1,3 @@
-/*
- * test_advanced_sql.cpp
- *    Advanced SQL features: COPY, LISTEN/NOTIFY, SAVEPOINTs,
- *    binary format, async queries, CTEs, window functions,
- *    multiple databases, JSON, and binary parameters.
- */
 #include "test_helpers.hpp"
 #include <cstring>
 #include <string>
@@ -12,8 +6,6 @@
 #include <arpa/inet.h>
 
 class AdvancedSqlTest : public EmbedPgTest {};
-
-// ---- SAVEPOINT / nested transactions ----
 
 TEST_F(AdvancedSqlTest, SavepointRollback) {
     TestConnection conn(srv());
@@ -36,7 +28,6 @@ TEST_F(AdvancedSqlTest, SavepointRollback) {
 
     res = conn.exec("SELECT count(*) FROM test_sp");
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
-    // Only row 1 survives — row 2 was rolled back to savepoint
     EXPECT_STREQ(PQgetvalue(res, 0, 0), "1");
     PQclear(res);
 
@@ -86,7 +77,7 @@ TEST_F(AdvancedSqlTest, NestedSavepoints) {
 
     PGresult *res = conn.exec("SELECT id FROM test_nested ORDER BY id");
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
-    // Rows 1 and 5 survive; 2, 3, 4 were rolled back
+    // Rows 1 and 5 survive; 2, 3 and 4 were rolled back
     EXPECT_EQ(PQntuples(res), 2);
     EXPECT_STREQ(PQgetvalue(res, 0, 0), "1");
     EXPECT_STREQ(PQgetvalue(res, 1, 0), "5");
@@ -94,8 +85,6 @@ TEST_F(AdvancedSqlTest, NestedSavepoints) {
 
     conn.exec("DROP TABLE test_nested");
 }
-
-// ---- COPY protocol ----
 
 TEST_F(AdvancedSqlTest, CopyToStdout) {
     TestConnection conn(srv());
@@ -117,7 +106,6 @@ TEST_F(AdvancedSqlTest, CopyToStdout) {
     }
     EXPECT_EQ(row_count, 3);
 
-    // End of COPY
     res = PQgetResult(conn.get());
     ASSERT_EQ(PQresultStatus(res), PGRES_COMMAND_OK);
     PQclear(res);
@@ -171,20 +159,17 @@ TEST_F(AdvancedSqlTest, CopyFromStdinError) {
     ASSERT_EQ(PQresultStatus(res), PGRES_COPY_IN);
     PQclear(res);
 
-    // Send a null value for a NOT NULL column
+    // NULL into a NOT NULL column
     const char *bad_row = "\\N\n";
     PQputCopyData(conn.get(), bad_row, (int)strlen(bad_row));
 
-    // Abort the COPY
+    // A non-NULL error string aborts the COPY
     int rc = PQputCopyEnd(conn.get(), "test-induced error");
     EXPECT_GE(rc, 0);
 
     res = PQgetResult(conn.get());
-    // Should be PGRES_FATAL_ERROR since we sent an error string
     PQclear(res);
 
-    // Connection should still be usable after COPY error
-    // (may need to rollback if in an aborted transaction)
     PQexec(conn.get(), "ROLLBACK");
     res = conn.exec("SELECT 1");
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
@@ -192,8 +177,6 @@ TEST_F(AdvancedSqlTest, CopyFromStdinError) {
 
     conn.exec("DROP TABLE test_copy_err");
 }
-
-// ---- LISTEN / NOTIFY ----
 
 TEST_F(AdvancedSqlTest, ListenNotify) {
     TestConnection listener(srv());
@@ -209,10 +192,8 @@ TEST_F(AdvancedSqlTest, ListenNotify) {
     ASSERT_EQ(PQresultStatus(res), PGRES_COMMAND_OK);
     PQclear(res);
 
-    // Consume any pending input on the listener connection
-    PQconsumeInput(listener.get());
-    PGnotify *notify = PQnotifies(listener.get());
-    ASSERT_NE(notify, nullptr);
+    PGnotify *notify = wait_for_notify(listener.get(), 10000);
+    ASSERT_NE(notify, nullptr) << "no notification within 10s";
     EXPECT_STREQ(notify->relname, "test_channel");
     EXPECT_STREQ(notify->extra, "hello");
     PQfreemem(notify);
@@ -226,13 +207,10 @@ TEST_F(AdvancedSqlTest, NotifyWithoutListeners) {
     TestConnection conn(srv());
     ASSERT_TRUE(conn.is_ok());
 
-    // NOTIFY with no listeners should still succeed
     PGresult *res = conn.exec("NOTIFY orphan_channel, 'payload'");
     EXPECT_EQ(PQresultStatus(res), PGRES_COMMAND_OK);
     PQclear(res);
 }
-
-// ---- Async queries ----
 
 TEST_F(AdvancedSqlTest, AsyncQuery) {
     TestConnection conn(srv());
@@ -278,7 +256,6 @@ TEST_F(AdvancedSqlTest, AsyncMultipleStatements) {
     TestConnection conn(srv());
     ASSERT_TRUE(conn.is_ok());
 
-    // PQsendQuery can send multiple statements separated by semicolons
     int rc = PQsendQuery(conn.get(), "SELECT 1; SELECT 2; SELECT 3");
     ASSERT_EQ(rc, 1);
 
@@ -297,23 +274,15 @@ TEST_F(AdvancedSqlTest, AsyncMultipleStatements) {
     EXPECT_EQ(results[2], "3");
 }
 
-// ---- Binary format results ----
-
 TEST_F(AdvancedSqlTest, BinaryIntResult) {
     TestConnection conn(srv());
     ASSERT_TRUE(conn.is_ok());
-
-    // Request binary format (resultFormat = 1)
-    const char *param_values[] = {nullptr};
-    const int param_lengths[] = {0};
-    const int param_formats[] = {0};  // text params
-    int result_format = 1;  // binary result
 
     PGresult *res = PQexecParams(conn.get(),
                                  "SELECT 12345::int4",
                                  0, nullptr,
                                  nullptr, nullptr, nullptr,
-                                 result_format);
+                                 1);   /* binary results */
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
 
     // Binary int4 is a 4-byte big-endian integer
@@ -333,7 +302,6 @@ TEST_F(AdvancedSqlTest, BinaryParams) {
     TestConnection conn(srv());
     ASSERT_TRUE(conn.is_ok());
 
-    // Send a binary int4 parameter
     int32_t param = htonl(9999);
     const char *param_values[] = { (char *)&param };
     const int param_lengths[] = { 4 };
@@ -348,8 +316,6 @@ TEST_F(AdvancedSqlTest, BinaryParams) {
     EXPECT_STREQ(PQgetvalue(res, 0, 0), "10000");
     PQclear(res);
 }
-
-// ---- CTEs (Common Table Expressions) ----
 
 TEST_F(AdvancedSqlTest, SimpleCTE) {
     TestConnection conn(srv());
@@ -375,8 +341,12 @@ TEST_F(AdvancedSqlTest, RecursiveCTE) {
         ") "
         "SELECT max(b) FROM fib");
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
-    // Fibonacci numbers < 100: 1,1,2,3,5,8,13,21,34,55,89 → max 89
-    EXPECT_STREQ(PQgetvalue(res, 0, 0), "89");
+    /*
+     * WHERE filters the *input* row of the recursive term, not the row it
+     * produces: (55,89) still passes b < 100 and emits (89,144), which then
+     * fails the check and stops the recursion.  So the largest b is 144.
+     */
+    EXPECT_STREQ(PQgetvalue(res, 0, 0), "144");
     PQclear(res);
 }
 
@@ -411,8 +381,6 @@ TEST_F(AdvancedSqlTest, WritableCTE) {
     conn.exec("DROP TABLE cte_target");
 }
 
-// ---- Window functions ----
-
 TEST_F(AdvancedSqlTest, WindowFunctionRowNumber) {
     TestConnection conn(srv());
     ASSERT_TRUE(conn.is_ok());
@@ -429,12 +397,10 @@ TEST_F(AdvancedSqlTest, WindowFunctionRowNumber) {
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
     EXPECT_EQ(PQntuples(res), 5);
 
-    // First row in group 'a' (val=1) should have rn=1
     EXPECT_STREQ(PQgetvalue(res, 0, 0), "a");
     EXPECT_STREQ(PQgetvalue(res, 0, 1), "1");
     EXPECT_STREQ(PQgetvalue(res, 0, 2), "1");
 
-    // First row in group 'b' (val=4) should have rn=1
     EXPECT_STREQ(PQgetvalue(res, 3, 0), "b");
     EXPECT_STREQ(PQgetvalue(res, 3, 1), "4");
     EXPECT_STREQ(PQgetvalue(res, 3, 2), "1");
@@ -453,15 +419,12 @@ TEST_F(AdvancedSqlTest, WindowFunctionRunningSum) {
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
     EXPECT_EQ(PQntuples(res), 5);
 
-    // Running sums: 1, 3, 6, 10, 15
     const char *expected[] = {"1","3","6","10","15"};
     for (int i = 0; i < 5; i++) {
         EXPECT_STREQ(PQgetvalue(res, i, 1), expected[i]) << "Row " << i;
     }
     PQclear(res);
 }
-
-// ---- JSON ----
 
 TEST_F(AdvancedSqlTest, JsonbQuery) {
     TestConnection conn(srv());
@@ -503,19 +466,15 @@ TEST_F(AdvancedSqlTest, JsonPath) {
     PQclear(res);
 }
 
-// ---- CREATE DATABASE / multi-database ----
-
 TEST_F(AdvancedSqlTest, CreateAndConnectToDatabase) {
     TestConnection conn(srv());
     ASSERT_TRUE(conn.is_ok());
 
-    // Create a new database
     PGresult *res = conn.exec("CREATE DATABASE test_newdb");
     ASSERT_EQ(PQresultStatus(res), PGRES_COMMAND_OK)
         << PQerrorMessage(conn.get());
     PQclear(res);
 
-    // Connect to the new database
     PGconn *newconn = embed_pg_connect(srv(), "test_newdb", "postgres");
     ASSERT_NE(newconn, nullptr);
     ASSERT_EQ(PQstatus(newconn), CONNECTION_OK)
@@ -526,7 +485,6 @@ TEST_F(AdvancedSqlTest, CreateAndConnectToDatabase) {
     EXPECT_STREQ(PQgetvalue(res2, 0, 0), "test_newdb");
     PQclear(res2);
 
-    // Create a table in the new database
     res2 = PQexec(newconn, "CREATE TABLE only_here (val int)");
     ASSERT_EQ(PQresultStatus(res2), PGRES_COMMAND_OK);
     PQclear(res2);
@@ -537,7 +495,6 @@ TEST_F(AdvancedSqlTest, CreateAndConnectToDatabase) {
 
     PQfinish(newconn);
 
-    // The table should not exist in the original postgres database
     res = conn.exec("SELECT to_regclass('public.only_here')");
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
     EXPECT_EQ(PQgetisnull(res, 0, 0), 1)
@@ -546,8 +503,6 @@ TEST_F(AdvancedSqlTest, CreateAndConnectToDatabase) {
 
     conn.exec("DROP DATABASE test_newdb");
 }
-
-// ---- Transaction isolation levels ----
 
 TEST_F(AdvancedSqlTest, RepeatableRead) {
     TestConnection conn1(srv());
@@ -558,19 +513,15 @@ TEST_F(AdvancedSqlTest, RepeatableRead) {
     conn1.exec("CREATE TABLE iso_test (val int)");
     conn1.exec("INSERT INTO iso_test VALUES (100)");
 
-    // Start a REPEATABLE READ transaction on conn1
     conn1.exec("BEGIN ISOLATION LEVEL REPEATABLE READ");
 
-    // Read initial value in conn1
     PGresult *res = conn1.exec("SELECT val FROM iso_test");
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
     EXPECT_STREQ(PQgetvalue(res, 0, 0), "100");
     PQclear(res);
 
-    // conn2 updates the value and commits
     conn2.exec("UPDATE iso_test SET val = 200");
 
-    // conn1 should still see 100 under REPEATABLE READ
     res = conn1.exec("SELECT val FROM iso_test");
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
     EXPECT_STREQ(PQgetvalue(res, 0, 0), "100")
@@ -582,35 +533,28 @@ TEST_F(AdvancedSqlTest, RepeatableRead) {
     conn1.exec("DROP TABLE iso_test");
 }
 
-// ---- Prepared statements across connections ----
-
 TEST_F(AdvancedSqlTest, PreparedStatementsAreConnectionLocal) {
     TestConnection conn1(srv());
     TestConnection conn2(srv());
     ASSERT_TRUE(conn1.is_ok());
     ASSERT_TRUE(conn2.is_ok());
 
-    // Prepare on conn1
     PGresult *res = PQprepare(conn1.get(), "my_stmt", "SELECT $1::int * 2",
                               1, nullptr);
     ASSERT_EQ(PQresultStatus(res), PGRES_COMMAND_OK);
     PQclear(res);
 
-    // Execute on conn1 — should work
     const char *p1[] = {"21"};
     res = PQexecPrepared(conn1.get(), "my_stmt", 1, p1, nullptr, nullptr, 0);
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
     EXPECT_STREQ(PQgetvalue(res, 0, 0), "42");
     PQclear(res);
 
-    // Execute on conn2 — should fail (prepared statements are session-local)
     res = PQexecPrepared(conn2.get(), "my_stmt", 1, p1, nullptr, nullptr, 0);
     EXPECT_EQ(PQresultStatus(res), PGRES_FATAL_ERROR)
         << "Prepared statement should not be visible on another connection";
     PQclear(res);
 }
-
-// ---- RETURNING clause ----
 
 TEST_F(AdvancedSqlTest, UpdateReturning) {
     TestConnection conn(srv());
@@ -648,68 +592,57 @@ TEST_F(AdvancedSqlTest, DeleteReturning) {
     conn.exec("DROP TABLE del_ret");
 }
 
-// ---- Error handling in transactions (aborted state) ----
-
 TEST_F(AdvancedSqlTest, AbortedTransactionRecovery) {
     TestConnection conn(srv());
     ASSERT_TRUE(conn.is_ok());
 
     conn.exec("BEGIN");
 
-    // This causes an error, putting the transaction in aborted state
     PGresult *res = conn.exec("SELECT 1/0");
     EXPECT_EQ(PQresultStatus(res), PGRES_FATAL_ERROR);
     PQclear(res);
 
-    // All subsequent commands fail with "current transaction is aborted"
+    // Aborted state: every later command fails until the transaction ends
     res = conn.exec("SELECT 1");
     EXPECT_EQ(PQresultStatus(res), PGRES_FATAL_ERROR);
     PQclear(res);
 
-    // ROLLBACK clears the error state
     res = conn.exec("ROLLBACK");
     EXPECT_EQ(PQresultStatus(res), PGRES_COMMAND_OK);
     PQclear(res);
 
-    // Now normal queries should work again
     res = conn.exec("SELECT 99");
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
     EXPECT_STREQ(PQgetvalue(res, 0, 0), "99");
     PQclear(res);
 }
 
-// ---- Large objects / bytea ----
-
 TEST_F(AdvancedSqlTest, ByteaRoundtrip) {
     TestConnection conn(srv());
     ASSERT_TRUE(conn.is_ok());
 
-    // Insert binary data via PQexecParams with bytea
     const char binary_data[] = "\x00\x01\x02\xfe\xff\x00hello";
     int data_len = 10;
 
     const char *params[] = { binary_data };
     int param_lengths[] = { data_len };
-    int param_formats[] = { 1 };  // binary
+    int param_formats[] = { 1 };
 
     PGresult *res = PQexecParams(conn.get(),
                                  "SELECT $1::bytea",
                                  1, nullptr,
                                  params, param_lengths, param_formats,
-                                 1);  // binary result
+                                 1);
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
     EXPECT_EQ(PQgetlength(res, 0, 0), data_len);
     EXPECT_EQ(memcmp(PQgetvalue(res, 0, 0), binary_data, data_len), 0);
     PQclear(res);
 }
 
-// ---- pg_catalog system queries ----
-
 TEST_F(AdvancedSqlTest, SystemCatalogQuery) {
     TestConnection conn(srv());
     ASSERT_TRUE(conn.is_ok());
 
-    // pg_tables
     PGresult *res = conn.exec(
         "SELECT count(*) FROM pg_catalog.pg_tables "
         "WHERE schemaname = 'pg_catalog'");
@@ -740,8 +673,6 @@ TEST_F(AdvancedSqlTest, InformationSchema) {
 
     conn.exec("DROP TABLE info_schema_test");
 }
-
-// ---- Multiple data types ----
 
 TEST_F(AdvancedSqlTest, DataTypes) {
     TestConnection conn(srv());

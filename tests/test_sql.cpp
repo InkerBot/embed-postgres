@@ -197,7 +197,6 @@ TEST_F(SqlTest, ErrorQuery) {
     EXPECT_EQ(PQresultStatus(res), PGRES_FATAL_ERROR);
     PQclear(res);
 
-    // Connection should still work after error
     res = conn.exec("SELECT 1");
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
     EXPECT_STREQ(PQgetvalue(res, 0, 0), "1");
@@ -225,7 +224,6 @@ TEST_F(SqlTest, CrossConnectionVisibility) {
     conn1.exec("CREATE TABLE test_visibility (val text)");
     conn1.exec("INSERT INTO test_visibility VALUES ('visible')");
 
-    // conn2 should see committed data
     PGresult *res = conn2.exec("SELECT val FROM test_visibility");
     ASSERT_EQ(PQresultStatus(res), PGRES_TUPLES_OK);
     EXPECT_EQ(PQntuples(res), 1);

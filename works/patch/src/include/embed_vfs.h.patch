@@ -1,0 +1,267 @@
+diff --git a/src/include/embed_vfs.h b/src/include/embed_vfs.h
+new file mode 100644
+index 0000000..39ce5d3
+--- /dev/null
++++ b/src/include/embed_vfs.h
+@@ -0,0 +1,261 @@
++/*-------------------------------------------------------------------------
++ *
++ * embed_vfs.h
++ *	  File system access routed to the embedding host.
++ *
++ * When EMBED_VFS_SOCK names a socket, PostgreSQL stops talking to the kernel
++ * about files: names are resolved and bytes are moved by the host process on
++ * the other end, through memory the two share.  What a path means there, and where its contents live, is
++ * entirely the host's business — nothing here assumes a file system at all.
++ * Without such a socket every call below falls straight through to the system
++ * call, so an ordinary postgres is unaffected.
++ *
++ * An open file is identified by a handle the host chose.  Handles are wrapped
++ * in descriptor numbers at or above EMBED_VFS_FD_BASE, which no real descriptor
++ * reaches, so the fd-level entry points can tell the two apart and send only
++ * the wrapped ones to the host.
++ *
++ * The entry points are redirected wholesale at the bottom of this file, the way
++ * the Windows port redirects them in win32_port.h, so that call sites all over
++ * the tree — backend and frontend alike — need no changes.
++ *
++ * Keep the protocol in sync with the embed library's src/embed_vfs_protocol.h.
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef EMBED_VFS_H
++#define EMBED_VFS_H
++
++/*
++ * Pulled in before the redirection below, not because this file needs all of
++ * them, but because the macros would otherwise rewrite these declarations in
++ * any file that includes a system header after us — and where a declaration
++ * carries an asm label, the rewritten name binds straight back to the system
++ * call, silently undoing the redirection.
++ */
++#include <dirent.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <sys/stat.h>
++#include <sys/statvfs.h>
++#include <sys/time.h>
++#include <sys/types.h>
++#include <sys/uio.h>
++#include <unistd.h>
++#include <utime.h>
++
++/*
++ * Descriptors at or above this stand for handles the host owns.  Real ones stay
++ * far below: the kernel always hands out the lowest free number.
++ */
++#define EMBED_VFS_FD_BASE 0x40000000
++#define EMBED_VFS_PATH_MAX 1024
++
++/*
++ * The protocol.  Each process gets a region of memory shared with the host, and
++ * every exchange happens there: the request, the names it concerns, the reply
++ * and the bytes moved all sit in the region.  The socket only carries a byte
++ * saying "your turn" in each direction, plus the one thing memory cannot hold —
++ * a descriptor, when an open is answered with the file itself.  The sender's
++ * system call orders its stores before the receiver's returns, so the doorbell
++ * is the only synchronisation needed.
++ */
++
++/* Largest payload in one exchange; bigger transfers are split by the client */
++#define EMBED_VFS_IO_MAX (1024 * 1024)
++
++/* Most directory entries delivered in one exchange, in bytes */
++#define EMBED_VFS_DIR_BATCH (64 * 1024)
++
++#define EMBED_VFS_MAGIC		0x53465645	/* "EVFS" */
++#define EMBED_VFS_VERSION	2
++
++/* The byte on the socket */
++#define EMBED_VFS_MSG_HELLO		'H'		/* host -> client, carries the region */
++#define EMBED_VFS_MSG_REQUEST	'Q'		/* client -> host: a request is ready */
++#define EMBED_VFS_MSG_REPLY		'A'		/* host -> client: the reply is ready */
++
++enum {
++    EMBED_VFS_OP_GETATTR = 1,
++    EMBED_VFS_OP_ACCESS,
++    EMBED_VFS_OP_READLINK,      /* answer in data */
++    EMBED_VFS_OP_MKDIR,
++    EMBED_VFS_OP_UNLINK,
++    EMBED_VFS_OP_RMDIR,
++    EMBED_VFS_OP_SYMLINK,       /* path is the target, path2 the link */
++    EMBED_VFS_OP_RENAME,        /* uses path2 */
++    EMBED_VFS_OP_LINK,          /* uses path2 */
++    EMBED_VFS_OP_CHMOD,
++    EMBED_VFS_OP_UTIMENS,       /* atime in offset, mtime in length */
++    EMBED_VFS_OP_STATFS,
++    EMBED_VFS_OP_TRUNCATE,
++    EMBED_VFS_OP_OPEN,          /* reply carries the handle */
++    EMBED_VFS_OP_CREATE,        /* reply carries the handle */
++    EMBED_VFS_OP_READ,          /* bytes read in data */
++    EMBED_VFS_OP_WRITE,         /* bytes to write in data */
++    EMBED_VFS_OP_FSYNC,
++    EMBED_VFS_OP_FALLOCATE,
++    EMBED_VFS_OP_RELEASE,
++    EMBED_VFS_OP_OPENDIR,       /* reply carries the handle */
++    EMBED_VFS_OP_READDIR,       /* a batch of EmbedVfsDirent in data */
++    EMBED_VFS_OP_RELEASEDIR,
++};
++
++typedef struct EmbedVfsRequest {
++    int                 op;
++    int                 flags;      /* open flags, access mask, fsync datasync */
++    unsigned int        mode;       /* open/mkdir/chmod mode */
++    unsigned long long  fh;         /* the host's handle, when there is one */
++    long long           offset;     /* read/write offset, utimens atime */
++    long long           length;     /* byte count, truncate size, utimens mtime */
++    long long           index;      /* readdir position */
++} EmbedVfsRequest;
++
++typedef struct EmbedVfsReply {
++    int                 result;     /* 0 on success, -1 on failure */
++    int                 err;        /* errno when result is -1 */
++    int                 has_fd;     /* open: a descriptor came with the doorbell */
++    unsigned long long  fh;         /* open/opendir: the host's handle */
++    long long           length;     /* bytes in data */
++    long long           index;      /* readdir: where the next batch starts */
++
++    /* getattr */
++    long long           size;
++    long long           mtime;
++    long long           atime;
++    long long           ctime;
++    long long           dev;
++    long long           ino;        /* the backend compares these to identify files */
++    long long           blocks;
++    unsigned int        mode;
++    unsigned int        nlink;
++    unsigned int        uid;
++    unsigned int        gid;
++
++    /* statfs */
++    unsigned long long  f_bsize;
++    unsigned long long  f_blocks;
++    unsigned long long  f_bfree;
++    unsigned long long  f_bavail;
++    unsigned long long  f_files;
++    unsigned long long  f_ffree;
++} EmbedVfsReply;
++
++/* One directory entry in a readdir batch; `reclen` keeps the next one aligned */
++typedef struct EmbedVfsDirent {
++    long long           ino;
++    unsigned int        mode;
++    unsigned short      reclen;     /* this record, name and padding included */
++    char                name[];     /* NUL-terminated */
++} EmbedVfsDirent;
++
++/* The region one process shares with the host */
++typedef struct EmbedVfsShared {
++    unsigned int        magic;
++    unsigned int        version;
++    EmbedVfsRequest     req;
++    EmbedVfsReply       reply;
++    char                path[EMBED_VFS_PATH_MAX];
++    char                path2[EMBED_VFS_PATH_MAX];
++    char                data[EMBED_VFS_IO_MAX] pg_attribute_aligned(64);
++} EmbedVfsShared;
++
++
++extern int	embed_vfs_open(const char *path, int flags, ...);
++extern FILE *embed_vfs_fopen(const char *path, const char *mode);
++extern DIR *embed_vfs_opendir(const char *path);
++extern struct dirent *embed_vfs_readdir(DIR *dir);
++extern int	embed_vfs_closedir(DIR *dir);
++extern int	embed_vfs_dirfd(DIR *dir);
++extern int	embed_vfs_fileno(FILE *stream);
++extern void embed_vfs_rewinddir(DIR *dir);
++
++extern int	embed_vfs_stat(const char *path, struct stat *st);
++extern int	embed_vfs_lstat(const char *path, struct stat *st);
++extern int	embed_vfs_fstat(int fd, struct stat *st);
++extern int	embed_vfs_statvfs(const char *path, struct statvfs *buf);
++extern int	embed_vfs_unlink(const char *path);
++extern int	embed_vfs_mkdir(const char *path, mode_t mode);
++extern int	embed_vfs_rmdir(const char *path);
++extern int	embed_vfs_rename(const char *from, const char *to);
++extern int	embed_vfs_link(const char *from, const char *to);
++extern int	embed_vfs_access(const char *path, int mode);
++extern int	embed_vfs_chmod(const char *path, mode_t mode);
++extern int	embed_vfs_symlink(const char *target, const char *linkpath);
++extern ssize_t embed_vfs_readlink(const char *path, char *buf, size_t len);
++extern int	embed_vfs_truncate(const char *path, off_t length);
++extern int	embed_vfs_chdir(const char *path);
++extern char *embed_vfs_getcwd(char *buf, size_t size);
++extern int	embed_vfs_utime(const char *path, const struct utimbuf *times);
++extern int	embed_vfs_utimes(const char *path, const struct timeval *times);
++
++extern ssize_t embed_vfs_read(int fd, void *buf, size_t count);
++extern ssize_t embed_vfs_write(int fd, const void *buf, size_t count);
++extern ssize_t embed_vfs_pread(int fd, void *buf, size_t count, off_t offset);
++extern ssize_t embed_vfs_pwrite(int fd, const void *buf, size_t count, off_t offset);
++extern ssize_t embed_vfs_preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset);
++extern ssize_t embed_vfs_pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset);
++extern off_t embed_vfs_lseek(int fd, off_t offset, int whence);
++extern int	embed_vfs_close(int fd);
++extern int	embed_vfs_fsync(int fd);
++extern int	embed_vfs_fdatasync(int fd);
++extern int	embed_vfs_ftruncate(int fd, off_t length);
++extern int	embed_vfs_fcntl(int fd, int cmd, ...);
++extern int	embed_vfs_dup(int fd);
++
++/*
++ * Called in a freshly forked child, which cannot keep using the channel its
++ * parent opened: replies would go to whichever process read the socket first.
++ */
++extern void embed_vfs_reset_after_fork(void);
++
++/*
++ * EMBED_VFS_NO_REDIRECT keeps the implementation itself, and anything else that
++ * genuinely means the kernel, on the real system calls.
++ */
++#ifndef EMBED_VFS_NO_REDIRECT
++
++#define open(...)			embed_vfs_open(__VA_ARGS__)
++#define fopen(path, mode)	embed_vfs_fopen(path, mode)
++#define opendir(path)		embed_vfs_opendir(path)
++#define readdir(dir)		embed_vfs_readdir(dir)
++#define closedir(dir)		embed_vfs_closedir(dir)
++#define dirfd(dir)			embed_vfs_dirfd(dir)
++#define fileno(f)			embed_vfs_fileno(f)
++#define rewinddir(dir)		embed_vfs_rewinddir(dir)
++#define stat(path, buf)		embed_vfs_stat(path, buf)
++#define lstat(path, buf)	embed_vfs_lstat(path, buf)
++#define fstat(fd, buf)		embed_vfs_fstat(fd, buf)
++#define statvfs(path, buf)	embed_vfs_statvfs(path, buf)
++#define unlink(path)		embed_vfs_unlink(path)
++#define mkdir(path, mode)	embed_vfs_mkdir(path, mode)
++#define rmdir(path)			embed_vfs_rmdir(path)
++#define rename(from, to)	embed_vfs_rename(from, to)
++#define link(from, to)		embed_vfs_link(from, to)
++#define access(path, mode)	embed_vfs_access(path, mode)
++#define chmod(path, mode)	embed_vfs_chmod(path, mode)
++#define symlink(t, l)		embed_vfs_symlink(t, l)
++#define readlink(p, b, n)	embed_vfs_readlink(p, b, n)
++#define truncate(p, n)		embed_vfs_truncate(p, n)
++#define chdir(path)			embed_vfs_chdir(path)
++#define getcwd(buf, size)	embed_vfs_getcwd(buf, size)
++#define utime(p, t)			embed_vfs_utime(p, t)
++#define utimes(p, t)		embed_vfs_utimes(p, t)
++
++#define read(fd, buf, n)	embed_vfs_read(fd, buf, n)
++#define write(fd, buf, n)	embed_vfs_write(fd, buf, n)
++#define pread(fd, b, n, o)	embed_vfs_pread(fd, b, n, o)
++#define pwrite(fd, b, n, o) embed_vfs_pwrite(fd, b, n, o)
++#define preadv(f, v, n, o)	embed_vfs_preadv(f, v, n, o)
++#define pwritev(f, v, n, o) embed_vfs_pwritev(f, v, n, o)
++#define lseek(fd, off, wh)	embed_vfs_lseek(fd, off, wh)
++#define close(fd)			embed_vfs_close(fd)
++#define fsync(fd)			embed_vfs_fsync(fd)
++#define fdatasync(fd)		embed_vfs_fdatasync(fd)
++#define ftruncate(fd, len)	embed_vfs_ftruncate(fd, len)
++#define fcntl(...)			embed_vfs_fcntl(__VA_ARGS__)
++#define dup(fd)				embed_vfs_dup(fd)
++
++#endif							/* EMBED_VFS_NO_REDIRECT */
++
++#endif							/* EMBED_VFS_H */

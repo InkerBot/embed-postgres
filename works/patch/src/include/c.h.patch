@@ -1,0 +1,17 @@
+diff --git a/src/include/c.h b/src/include/c.h
+index fd6b093..3d1ad43 100644
+--- a/src/include/c.h
++++ b/src/include/c.h
+@@ -1499,6 +1499,12 @@ typedef uint32_t char32_t;
+ #endif
+ #endif
+ 
++/*
++ * Last, so that it sees the system declarations it replaces: this redirects the
++ * file system entry points to the embedding host when one is present.
++ */
++#include "embed_vfs.h"
++
+ /* IWYU pragma: end_exports */
+ 
+ #endif							/* C_H */
